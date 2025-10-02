@@ -78,7 +78,6 @@ func (s *mockCodecs) EncoderForVersion(encoder runtime.Encoder, gv runtime.Group
 }
 
 func TestDeleteResourceAuditLogRequestObject(t *testing.T) {
-
 	ctx := audit.WithAuditContext(context.TODO())
 	ac := audit.AuditContextFrom(ctx)
 	if err := ac.Init(audit.RequestAuditConfig{Level: auditinternal.LevelRequestResponse}, nil); err != nil {
@@ -130,7 +129,6 @@ func TestDeleteResourceAuditLogRequestObject(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-
 			codecs := &mockCodecs{}
 			codecs.CodecFactory = test.serializer
 
@@ -413,9 +411,11 @@ func (n *fakeSerializer) SupportedMediaTypes() []runtime.SerializerInfo {
 		},
 	}
 }
+
 func (n *fakeSerializer) EncoderForVersion(serializer runtime.Encoder, gv runtime.GroupVersioner) runtime.Encoder {
 	return n.serializer
 }
+
 func (n *fakeSerializer) DecoderToVersion(serializer runtime.Decoder, gv runtime.GroupVersioner) runtime.Decoder {
 	return n.serializer
 }
@@ -690,25 +690,19 @@ func TestDeleteResourceWithUnsafeDeletionFlow(t *testing.T) {
 		//  false: it implements CorruptObjectDeleterProvider, but returns nil when asked for an unsafe deleter
 		registryHasUnsafeDeleter *bool
 		// what the user passes in the delete options for ignoreStoreReadErrorWithClusterBreakingPotential
-		ignoreReadErr      *bool
-		authorizer         authorizer.Authorizer
-		normalFlowObserved *deletionFlowTracker // records what the normal deletion flow observes
-		unsafeFlowObserved *deletionFlowTracker // records what the unsafe deletion flow observes
+		ignoreReadErr *bool
+		authorizer    authorizer.Authorizer
 		// want
-		normalFlowWant       *deletionFlowTracker // what the normal deletion flow should observe
-		unsafeFlowWant       *deletionFlowTracker // what the unsafe deletion flow should observe
-		unsafeAnnotationWant bool                 // whether the unsafe audit annotation should be added
-		status               metav1.Status        // status we expect from the HTTP response
+		flowWant             *deletionFlowTracker
+		unsafeAnnotationWant bool          // whether the unsafe audit annotation should be added
+		status               metav1.Status // status we expect from the HTTP response
 	}{
 		{
 			name:                     "feature disabled, registry does not implement CorruptObjectDeleterProvider, ignore is false, should invoke the normal deletion flow",
 			featureEnabled:           false,
 			registryHasUnsafeDeleter: nil,
 			ignoreReadErr:            ptr.To(false),
-			normalFlowObserved:       &deletionFlowTracker{},
-			normalFlowWant:           &deletionFlowTracker{Invoked: 1, Ignore: nil},
-			unsafeFlowObserved:       &deletionFlowTracker{},
-			unsafeFlowWant:           &deletionFlowTracker{},
+			flowWant:                 &deletionFlowTracker{Invoked: 1, Ignore: nil},
 			status:                   success,
 		},
 		{
@@ -716,10 +710,7 @@ func TestDeleteResourceWithUnsafeDeletionFlow(t *testing.T) {
 			featureEnabled:           false,
 			registryHasUnsafeDeleter: nil,
 			ignoreReadErr:            ptr.To(true),
-			normalFlowObserved:       &deletionFlowTracker{},
-			normalFlowWant:           &deletionFlowTracker{Invoked: 1, Ignore: nil},
-			unsafeFlowObserved:       &deletionFlowTracker{},
-			unsafeFlowWant:           &deletionFlowTracker{},
+			flowWant:                 &deletionFlowTracker{Invoked: 1, Ignore: nil},
 			status:                   success,
 		},
 		{
@@ -727,10 +718,7 @@ func TestDeleteResourceWithUnsafeDeletionFlow(t *testing.T) {
 			featureEnabled:           false,
 			registryHasUnsafeDeleter: ptr.To(false),
 			ignoreReadErr:            ptr.To(false),
-			normalFlowObserved:       &deletionFlowTracker{},
-			normalFlowWant:           &deletionFlowTracker{Invoked: 1, Ignore: nil},
-			unsafeFlowObserved:       &deletionFlowTracker{},
-			unsafeFlowWant:           &deletionFlowTracker{},
+			flowWant:                 &deletionFlowTracker{Invoked: 1, Ignore: nil},
 			status:                   success,
 		},
 		{
@@ -738,10 +726,7 @@ func TestDeleteResourceWithUnsafeDeletionFlow(t *testing.T) {
 			featureEnabled:           false,
 			registryHasUnsafeDeleter: ptr.To(false),
 			ignoreReadErr:            ptr.To(true),
-			normalFlowObserved:       &deletionFlowTracker{},
-			normalFlowWant:           &deletionFlowTracker{Invoked: 1, Ignore: nil},
-			unsafeFlowObserved:       &deletionFlowTracker{},
-			unsafeFlowWant:           &deletionFlowTracker{},
+			flowWant:                 &deletionFlowTracker{Invoked: 1, Ignore: nil},
 			status:                   success,
 		},
 		{
@@ -749,10 +734,7 @@ func TestDeleteResourceWithUnsafeDeletionFlow(t *testing.T) {
 			featureEnabled:           false,
 			registryHasUnsafeDeleter: ptr.To(true),
 			ignoreReadErr:            ptr.To(false),
-			normalFlowObserved:       &deletionFlowTracker{},
-			normalFlowWant:           &deletionFlowTracker{Invoked: 1, Ignore: nil},
-			unsafeFlowObserved:       &deletionFlowTracker{},
-			unsafeFlowWant:           &deletionFlowTracker{},
+			flowWant:                 &deletionFlowTracker{Invoked: 1, Ignore: nil},
 			status:                   success,
 		},
 		{
@@ -760,10 +742,7 @@ func TestDeleteResourceWithUnsafeDeletionFlow(t *testing.T) {
 			featureEnabled:           false,
 			registryHasUnsafeDeleter: ptr.To(true),
 			ignoreReadErr:            ptr.To(true),
-			normalFlowObserved:       &deletionFlowTracker{},
-			normalFlowWant:           &deletionFlowTracker{Invoked: 1, Ignore: nil},
-			unsafeFlowObserved:       &deletionFlowTracker{},
-			unsafeFlowWant:           &deletionFlowTracker{},
+			flowWant:                 &deletionFlowTracker{Invoked: 1, Ignore: nil},
 			status:                   success,
 		},
 
@@ -773,10 +752,7 @@ func TestDeleteResourceWithUnsafeDeletionFlow(t *testing.T) {
 			featureEnabled:           true,
 			registryHasUnsafeDeleter: nil,
 			ignoreReadErr:            nil,
-			normalFlowObserved:       &deletionFlowTracker{},
-			normalFlowWant:           &deletionFlowTracker{Invoked: 1, Ignore: nil},
-			unsafeFlowObserved:       &deletionFlowTracker{},
-			unsafeFlowWant:           &deletionFlowTracker{},
+			flowWant:                 &deletionFlowTracker{Invoked: 1, Ignore: nil},
 			status:                   success,
 		},
 		{
@@ -784,10 +760,7 @@ func TestDeleteResourceWithUnsafeDeletionFlow(t *testing.T) {
 			featureEnabled:           true,
 			registryHasUnsafeDeleter: nil,
 			ignoreReadErr:            ptr.To(false),
-			normalFlowObserved:       &deletionFlowTracker{},
-			normalFlowWant:           &deletionFlowTracker{Invoked: 1, Ignore: ptr.To(false)},
-			unsafeFlowObserved:       &deletionFlowTracker{},
-			unsafeFlowWant:           &deletionFlowTracker{},
+			flowWant:                 &deletionFlowTracker{Invoked: 1, Ignore: ptr.To(false)},
 			status:                   success,
 		},
 		{
@@ -795,10 +768,7 @@ func TestDeleteResourceWithUnsafeDeletionFlow(t *testing.T) {
 			featureEnabled:           true,
 			registryHasUnsafeDeleter: nil,
 			ignoreReadErr:            ptr.To(true),
-			normalFlowObserved:       &deletionFlowTracker{},
-			normalFlowWant:           &deletionFlowTracker{},
-			unsafeFlowObserved:       &deletionFlowTracker{},
-			unsafeFlowWant:           &deletionFlowTracker{},
+			flowWant:                 &deletionFlowTracker{},
 			unsafeAnnotationWant:     true,
 			status:                   newInternalError(fmt.Errorf("no unsafe deleter provided, can not honor ignoreStoreReadErrorWithClusterBreakingPotential")),
 		},
@@ -807,10 +777,7 @@ func TestDeleteResourceWithUnsafeDeletionFlow(t *testing.T) {
 			featureEnabled:           true,
 			registryHasUnsafeDeleter: ptr.To(false),
 			ignoreReadErr:            nil,
-			normalFlowObserved:       &deletionFlowTracker{},
-			normalFlowWant:           &deletionFlowTracker{Invoked: 1, Ignore: nil},
-			unsafeFlowObserved:       &deletionFlowTracker{},
-			unsafeFlowWant:           &deletionFlowTracker{},
+			flowWant:                 &deletionFlowTracker{Invoked: 1, Ignore: nil},
 			status:                   success,
 		},
 		{
@@ -818,10 +785,7 @@ func TestDeleteResourceWithUnsafeDeletionFlow(t *testing.T) {
 			featureEnabled:           true,
 			registryHasUnsafeDeleter: ptr.To(false),
 			ignoreReadErr:            ptr.To(false),
-			normalFlowObserved:       &deletionFlowTracker{},
-			normalFlowWant:           &deletionFlowTracker{Invoked: 1, Ignore: ptr.To(false)},
-			unsafeFlowObserved:       &deletionFlowTracker{},
-			unsafeFlowWant:           &deletionFlowTracker{},
+			flowWant:                 &deletionFlowTracker{Invoked: 1, Ignore: ptr.To(false)},
 			status:                   success,
 		},
 		{
@@ -829,10 +793,7 @@ func TestDeleteResourceWithUnsafeDeletionFlow(t *testing.T) {
 			featureEnabled:           true,
 			registryHasUnsafeDeleter: ptr.To(false),
 			ignoreReadErr:            ptr.To(true),
-			normalFlowObserved:       &deletionFlowTracker{},
-			normalFlowWant:           &deletionFlowTracker{},
-			unsafeFlowObserved:       &deletionFlowTracker{},
-			unsafeFlowWant:           &deletionFlowTracker{},
+			flowWant:                 &deletionFlowTracker{},
 			unsafeAnnotationWant:     true,
 			status:                   newInternalError(fmt.Errorf("no unsafe deleter provided, can not honor ignoreStoreReadErrorWithClusterBreakingPotential")),
 		},
@@ -842,10 +803,7 @@ func TestDeleteResourceWithUnsafeDeletionFlow(t *testing.T) {
 			registryHasUnsafeDeleter: ptr.To(true),
 			ignoreReadErr:            nil,
 			authorizer:               &fakeAuthorizer{decision: authorizer.DecisionAllow, reason: "permitted"},
-			normalFlowObserved:       &deletionFlowTracker{},
-			normalFlowWant:           &deletionFlowTracker{Invoked: 1, Ignore: nil},
-			unsafeFlowObserved:       &deletionFlowTracker{},
-			unsafeFlowWant:           &deletionFlowTracker{},
+			flowWant:                 &deletionFlowTracker{Invoked: 1, Ignore: nil},
 			status:                   success,
 		},
 		{
@@ -854,10 +812,7 @@ func TestDeleteResourceWithUnsafeDeletionFlow(t *testing.T) {
 			registryHasUnsafeDeleter: ptr.To(true),
 			ignoreReadErr:            ptr.To(false),
 			authorizer:               &fakeAuthorizer{decision: authorizer.DecisionAllow, reason: "permitted"},
-			normalFlowObserved:       &deletionFlowTracker{},
-			normalFlowWant:           &deletionFlowTracker{Invoked: 1, Ignore: ptr.To(false)},
-			unsafeFlowObserved:       &deletionFlowTracker{},
-			unsafeFlowWant:           &deletionFlowTracker{},
+			flowWant:                 &deletionFlowTracker{Invoked: 1, Ignore: ptr.To(false)},
 			status:                   success,
 		},
 		{
@@ -865,10 +820,7 @@ func TestDeleteResourceWithUnsafeDeletionFlow(t *testing.T) {
 			featureEnabled:           true,
 			registryHasUnsafeDeleter: ptr.To(true),
 			ignoreReadErr:            ptr.To(true),
-			normalFlowObserved:       &deletionFlowTracker{},
-			normalFlowWant:           &deletionFlowTracker{},
-			unsafeFlowObserved:       &deletionFlowTracker{},
-			unsafeFlowWant:           &deletionFlowTracker{},
+			flowWant:                 &deletionFlowTracker{},
 			unsafeAnnotationWant:     true,
 			status:                   newInternalError(fmt.Errorf("no authorizer provided, unable to authorize unsafe delete")),
 		},
@@ -878,10 +830,7 @@ func TestDeleteResourceWithUnsafeDeletionFlow(t *testing.T) {
 			registryHasUnsafeDeleter: ptr.To(true),
 			ignoreReadErr:            ptr.To(true),
 			authorizer:               &fakeAuthorizer{decision: authorizer.DecisionDeny, reason: "not permitted"},
-			normalFlowObserved:       &deletionFlowTracker{},
-			normalFlowWant:           &deletionFlowTracker{},
-			unsafeFlowObserved:       &deletionFlowTracker{},
-			unsafeFlowWant:           &deletionFlowTracker{},
+			flowWant:                 &deletionFlowTracker{},
 			unsafeAnnotationWant:     true,
 			status:                   newForbiddenError(),
 		},
@@ -891,10 +840,7 @@ func TestDeleteResourceWithUnsafeDeletionFlow(t *testing.T) {
 			registryHasUnsafeDeleter: ptr.To(true),
 			ignoreReadErr:            ptr.To(true),
 			authorizer:               &fakeAuthorizer{decision: authorizer.DecisionAllow, reason: "permitted"},
-			normalFlowObserved:       &deletionFlowTracker{},
-			normalFlowWant:           &deletionFlowTracker{},
-			unsafeFlowObserved:       &deletionFlowTracker{},
-			unsafeFlowWant:           &deletionFlowTracker{Invoked: 1, Ignore: ptr.To(true)},
+			flowWant:                 &deletionFlowTracker{Invoked: 1, Ignore: ptr.To(true)},
 			unsafeAnnotationWant:     true,
 			status:                   success,
 		},
@@ -913,13 +859,14 @@ func TestDeleteResourceWithUnsafeDeletionFlow(t *testing.T) {
 
 			// create a fake deleter that will be used for the normal deletion
 			// flow, and it will record the normal deletion activities
-			var deleter rest.GracefulDeleter = &fakeRegistry{tracker: test.normalFlowObserved}
+			flowObserved := &deletionFlowTracker{}
+			var deleter rest.GracefulDeleter = &fakeRegistry{tracker: flowObserved}
 			if provider := test.registryHasUnsafeDeleter; provider != nil {
 				r := &fakeRegistryWithCorruptObjDeleter{GracefulDeleter: deleter}
 				if *provider {
 					// create a fake deleter that will be used for the unsafe deletion
 					// flow, and it will record the unsafe deletion activities
-					r.unsafeDeleter = &fakeRegistry{tracker: test.unsafeFlowObserved}
+					r.unsafeDeleter = &fakeRegistry{tracker: flowObserved}
 				}
 				deleter = r
 			}
@@ -936,23 +883,12 @@ func TestDeleteResourceWithUnsafeDeletionFlow(t *testing.T) {
 				t.Errorf("expected the unsafe deletion flow observation to match, diff: %s", cmp.Diff(want, got))
 			}
 
-			// normal deletion flow
-			if want, got := test.normalFlowWant, test.normalFlowObserved; !cmp.Equal(want, got) {
+			// deletion flow
+			if want, got := test.flowWant, flowObserved; !cmp.Equal(want, got) {
 				t.Errorf("expected the normal deletion flow observation to match, diff: %s", cmp.Diff(want, got))
 			}
-			// this is an invariant; if the feature is disabled the normal deletion
-			// flow should never see the ignore option set.
-			if got := test.normalFlowObserved; !test.featureEnabled && got.Invoked == 1 && got.Ignore != nil {
+			if got := flowObserved; !test.featureEnabled && got.Invoked == 1 && got.Ignore != nil {
 				t.Errorf("IgnoreStoreReadErrorWithClusterBreakingPotential should always be nil when the feature is disabled, but got: %t", *got.Ignore)
-			}
-
-			// unsafe deletion flow
-			if want, got := test.unsafeFlowWant, test.unsafeFlowObserved; !cmp.Equal(want, got) {
-				t.Errorf("expected the unsafe deletion flow observation to match, diff: %s", cmp.Diff(want, got))
-			}
-			// this is an invariant; when invoked, the unsafe deletion flow should always see the option enabled
-			if got := ptr.Deref(test.unsafeFlowObserved.Ignore, false); test.unsafeFlowObserved.Invoked == 1 && !got {
-				t.Errorf("IgnoreStoreReadErrorWithClusterBreakingPotential should be %t for the unsafe deletion flow, but got: %t", false, got)
 			}
 
 			// certain annotation should be added in unsafe delete
