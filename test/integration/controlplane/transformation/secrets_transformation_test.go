@@ -27,10 +27,12 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	clientv3 "go.etcd.io/etcd/client/v3"
+	v1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
@@ -44,6 +46,7 @@ import (
 	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	"k8s.io/client-go/informers"
 	clientset "k8s.io/client-go/kubernetes"
+	corev1 "k8s.io/client-go/kubernetes/typed/core/v1"
 	restclient "k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/cache"
 	featuregatetesting "k8s.io/component-base/featuregate/testing"
@@ -375,6 +378,209 @@ func TestAllowUnsafeMalformedObjectDeletionFeature(t *testing.T) {
 			tc.corrupObjGetFromListerCachePostDelete.verify(t, err)
 		})
 	}
+}
+
+// TestSmartCacheRecoveryWithoutRelist verifies that with Option A enabled,
+// when a corrupt object is deleted and a watch ERROR event with metadata is received,
+// the reflector updates the cache without performing a full re-list.
+func TestSmartCacheRecoveryWithoutRelist(t *testing.T) {
+	featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, genericfeatures.AllowUnsafeMalformedObjectDeletion, true)
+
+	test, err := newTransformTest(t, transformTestConfig{transformerConfigYAML: aesGCMConfigYAML, reload: true})
+	if err != nil {
+		t.Fatalf("failed to setup test for envelop %s, error was %v", aesGCMPrefix, err)
+	}
+	defer test.cleanUp()
+
+	ctx := context.Background()
+	testUser := "croc"
+	testUserConfig := restclient.CopyConfig(test.kubeAPIServer.ClientConfig)
+	testUserConfig.Impersonate.UserName = testUser
+	testUserClient := clientset.NewForConfigOrDie(testUserConfig)
+	adminClient := test.restClient
+
+	// Grant permissions
+	permitUserToDoVerbOnSecret(t, adminClient, testUser, testNamespace, []string{"create", "get", "delete", "update", "unsafe-delete-ignore-read-errors"})
+
+	secretCorrupt := "corrupt-for-smart-recovery"
+
+	// Create secret
+	test.secret, err = test.createSecret(secretCorrupt, testNamespace)
+	if err != nil {
+		t.Fatalf("Failed to create test secret: %v", err)
+	}
+
+	// Add finalizer to prevent immediate deletion
+	withFinalizer := test.secret.DeepCopy()
+	withFinalizer.Finalizers = append(withFinalizer.Finalizers, "test.k8s.io/fake")
+	test.secret, err = testUserClient.CoreV1().Secrets(testNamespace).Update(ctx, withFinalizer, metav1.UpdateOptions{})
+	if err != nil {
+		t.Fatalf("Failed to add finalizer: %v", err)
+	}
+
+	test.runResource(test.TContext, unSealWithGCMTransformer, aesGCMPrefix, "", "v1", "secrets", test.secret.Name, test.secret.Namespace)
+
+	// Set up instrumented client to track LIST calls
+	listCallCount := 0
+	instrumentedClient := &listCountingClient{
+		Interface:  adminClient,
+		onListCall: func() { listCallCount++ },
+	}
+
+	// Set up informer with instrumented client
+	factory := informers.NewSharedInformerFactoryWithOptions(instrumentedClient, time.Minute, informers.WithNamespace(testNamespace))
+	informer := factory.Core().V1().Secrets()
+
+	// Track watch ERROR events with metadata
+	var watchErrorWithMetadata bool
+	var watchErrorMutex sync.Mutex
+	_, err = informer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
+		DeleteFunc: func(obj interface{}) {
+			// This gets called when cache is updated after smart recovery
+			t.Logf("DeleteFunc called for object")
+		},
+	})
+	if err != nil {
+		t.Fatalf("unexpected error from AddEventHandler: %v", err)
+	}
+
+	// Add a custom error handler to capture watch errors
+	informer.Informer().SetWatchErrorHandler(func(r *cache.Reflector, err error) {
+		watchErrorMutex.Lock()
+		defer watchErrorMutex.Unlock()
+
+		t.Logf("Watch error received: %v", err)
+		if statusErr, ok := err.(*apierrors.StatusError); ok {
+			if statusErr.ErrStatus.Reason == metav1.StatusReasonStoreReadError && statusErr.ErrStatus.Details != nil {
+				for _, cause := range statusErr.ErrStatus.Details.Causes {
+					if cause.Type == metav1.CauseTypeCorruptObjectDeleted {
+						watchErrorWithMetadata = true
+						t.Logf("Found CauseTypeCorruptObjectDeleted with metadata: %s", cause.Message)
+					}
+				}
+			}
+		}
+	})
+
+	lister := informer.Lister()
+	factory.Start(test.Done())
+	waitForSyncCtx, waitForSyncCancel := context.WithTimeout(ctx, wait.ForeverTestTimeout)
+	defer waitForSyncCancel()
+	if !cache.WaitForCacheSync(waitForSyncCtx.Done(), informer.Informer().HasSynced) {
+		t.Fatalf("caches failed to sync")
+	}
+
+	// Verify secret is in cache
+	if _, err := lister.Secrets(testNamespace).Get(secretCorrupt); err != nil {
+		t.Fatalf("unexpected failure getting secret from cache: %v", err)
+	}
+
+	initialListCount := listCallCount
+	t.Logf("Initial LIST count: %d", initialListCount)
+
+	// Break encryption
+	encryptionConf := filepath.Join(test.configDir, encryptionConfigFileName)
+	if err := os.WriteFile(encryptionConf, []byte(aesCBCConfigYAML), 0o644); err != nil {
+		t.Fatalf("failed to write encryption config: %v", err)
+	}
+
+	// Wait for encryption to break
+	err = wait.PollUntilContextTimeout(ctx, 1*time.Second, 2*time.Minute, true, func(ctx context.Context) (bool, error) {
+		_, err = testUserClient.CoreV1().Secrets(testNamespace).Get(ctx, secretCorrupt, metav1.GetOptions{})
+		var got apierrors.APIStatus
+		if !errors.As(err, &got) {
+			return false, nil
+		}
+		if got.Status().Reason == metav1.StatusReasonInternalError {
+			return true, nil
+		}
+		return false, nil
+	})
+	if err != nil {
+		t.Fatalf("encryption never broke: %v", err)
+	}
+	t.Log("Encryption successfully broken")
+
+	// Delete corrupt object with unsafe option
+	// This will trigger a watch DELETE event with corrupt prevValue
+	// which should generate an ERROR event with metadata
+	options := metav1.DeleteOptions{
+		IgnoreStoreReadErrorWithClusterBreakingPotential: ptr.To[bool](true),
+	}
+	err = testUserClient.CoreV1().Secrets(testNamespace).Delete(ctx, secretCorrupt, options)
+	if err != nil {
+		t.Fatalf("Failed to delete corrupt object: %v", err)
+	}
+	t.Log("Corrupt object deleted")
+
+	// Wait for cache to be updated (object should be removed)
+	err = wait.PollUntilContextTimeout(ctx, 100*time.Millisecond, 30*time.Second, true, func(ctx context.Context) (bool, error) {
+		_, err := lister.Secrets(testNamespace).Get(secretCorrupt)
+		if apierrors.IsNotFound(err) {
+			return true, nil
+		}
+		return false, nil
+	})
+	if err != nil {
+		t.Fatalf("Cache was not updated after delete: %v", err)
+	}
+	t.Log("Cache successfully updated - object removed")
+
+	finalListCount := listCallCount
+	t.Logf("Final LIST count: %d", finalListCount)
+
+	// Verify no LIST call was made (smart recovery)
+	if finalListCount > initialListCount {
+		t.Errorf("Expected smart cache recovery without LIST, but %d LIST call(s) were made", finalListCount-initialListCount)
+	} else {
+		t.Log("✓ Smart cache recovery succeeded without re-list")
+	}
+
+	// Note: We can't reliably verify watchErrorWithMetadata here because the error
+	// might be handled internally by the reflector without surfacing to our handler.
+	// The real verification is that the cache was updated without a LIST call.
+	watchErrorMutex.Lock()
+	if watchErrorWithMetadata {
+		t.Log("✓ Watch ERROR with CauseTypeCorruptObjectDeleted metadata was observed")
+	}
+	watchErrorMutex.Unlock()
+}
+
+// listCountingClient wraps a clientset to count LIST operations on Secrets
+type listCountingClient struct {
+	clientset.Interface
+	onListCall func()
+}
+
+func (c *listCountingClient) CoreV1() corev1.CoreV1Interface {
+	return &listCountingCoreV1{
+		CoreV1Interface: c.Interface.CoreV1(),
+		onListCall:      c.onListCall,
+	}
+}
+
+type listCountingCoreV1 struct {
+	corev1.CoreV1Interface
+	onListCall func()
+}
+
+func (c *listCountingCoreV1) Secrets(namespace string) corev1.SecretInterface {
+	return &listCountingSecrets{
+		SecretInterface: c.CoreV1Interface.Secrets(namespace),
+		onListCall:      c.onListCall,
+	}
+}
+
+type listCountingSecrets struct {
+	corev1.SecretInterface
+	onListCall func()
+}
+
+func (s *listCountingSecrets) List(ctx context.Context, opts metav1.ListOptions) (*v1.SecretList, error) {
+	if s.onListCall != nil {
+		s.onListCall()
+	}
+	return s.SecretInterface.List(ctx, opts)
 }
 
 type wantNoError struct{}

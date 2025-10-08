@@ -2414,3 +2414,75 @@ func TestIsUnsupportedTableObject(t *testing.T) {
 		})
 	}
 }
+
+func TestParseCorruptObjectMetadata(t *testing.T) {
+	tests := []struct {
+		name              string
+		msg               string
+		expectedNamespace string
+		expectedName      string
+		expectedRV        string
+		expectError       bool
+	}{
+		{
+			name:              "namespaced resource",
+			msg:               "default:my-pod:12345",
+			expectedNamespace: "default",
+			expectedName:      "my-pod",
+			expectedRV:        "12345",
+			expectError:       false,
+		},
+		{
+			name:              "cluster-scoped resource",
+			msg:               "node-1:67890",
+			expectedNamespace: "",
+			expectedName:      "node-1",
+			expectedRV:        "67890",
+			expectError:       false,
+		},
+		{
+			name:        "invalid format - too few parts",
+			msg:         "invalid",
+			expectError: true,
+		},
+		{
+			name:        "invalid format - too many parts",
+			msg:         "a:b:c:d",
+			expectError: true,
+		},
+		{
+			name:              "namespaced with special characters",
+			msg:               "kube-system:kube-proxy-abc:99999",
+			expectedNamespace: "kube-system",
+			expectedName:      "kube-proxy-abc",
+			expectedRV:        "99999",
+			expectError:       false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			namespace, name, rv, err := parseCorruptObjectMetadata(tt.msg)
+			if tt.expectError {
+				if err == nil {
+					t.Error("expected error but got nil")
+				}
+				return
+			}
+			if err != nil {
+				t.Errorf("unexpected error: %v", err)
+				return
+			}
+			if namespace != tt.expectedNamespace {
+				t.Errorf("expected namespace %q, got %q", tt.expectedNamespace, namespace)
+			}
+			if name != tt.expectedName {
+				t.Errorf("expected name %q, got %q", tt.expectedName, name)
+			}
+			if rv != tt.expectedRV {
+				t.Errorf("expected resourceVersion %q, got %q", tt.expectedRV, rv)
+			}
+		})
+	}
+}
+

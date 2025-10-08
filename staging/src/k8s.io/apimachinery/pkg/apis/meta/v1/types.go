@@ -1073,6 +1073,12 @@ const (
 	// CauseTypeResourceVersionTooLarge is used to report that the requested resource version
 	// is newer than the data observed by the API server, so the request cannot be served.
 	CauseTypeResourceVersionTooLarge CauseType = "ResourceVersionTooLarge"
+	// CauseTypeCorruptObjectDeleted is used to report that a corrupt object was deleted
+	// from storage. The cause includes metadata about the deleted object to allow clients
+	// to update their cache without requiring a full re-list.
+	// The Field contains the etcd key path, and the Message contains encoded metadata
+	// in the format "namespace:name:resourceVersion" (or just "name:resourceVersion" for cluster-scoped).
+	CauseTypeCorruptObjectDeleted CauseType = "CorruptObjectDeleted"
 )
 
 // +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object

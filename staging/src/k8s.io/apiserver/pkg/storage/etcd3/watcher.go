@@ -31,6 +31,7 @@ import (
 	grpcstatus "google.golang.org/grpc/status"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/util/wait"
@@ -445,6 +446,7 @@ func (wc *watchChan) processEvents(wg *sync.WaitGroup) {
 		go wc.serialProcessEvents(wg)
 	}
 }
+
 func (wc *watchChan) serialProcessEvents(wg *sync.WaitGroup) {
 	defer wg.Done()
 	for {
@@ -571,6 +573,14 @@ func (wc *watchChan) acceptAll() bool {
 func (wc *watchChan) transform(e *event) (res *watch.Event, err error) {
 	curObj, oldObj, err := wc.prepareObjs(e)
 	if err != nil {
+		// Note: corruptObjectDeletedError should not reach here for DELETE events
+		// as they are now handled in prepareObjs() by sending DELETE with nil oldObj
+		var corruptDeletedErr *corruptObjectDeletedError
+		if errors.As(err, &corruptDeletedErr) {
+			klog.Errorf("Unexpected corruptObjectDeletedError in transform - this should have been handled in prepareObjs: %v", err)
+		}
+
+		// For other errors, return as error (will terminate watch)
 		klog.Errorf("failed to prepare current and previous objects: %v", err)
 		return nil, err
 	}
@@ -592,12 +602,17 @@ func (wc *watchChan) transform(e *event) (res *watch.Event, err error) {
 			Object: object,
 		}
 	case e.isDeleted:
-		if !wc.filter(oldObj) {
+		// Use oldObj if available, otherwise fall back to curObj (for corrupt data)
+		objToSend := oldObj
+		if objToSend == nil {
+			objToSend = curObj
+		}
+		if !wc.filter(objToSend) {
 			return nil, nil
 		}
 		res = &watch.Event{
 			Type:   watch.Deleted,
-			Object: oldObj,
+			Object: objToSend,
 		}
 	case e.isCreated:
 		if !wc.filter(curObj) {
@@ -712,6 +727,24 @@ func (wc *watchChan) prepareObjs(e *event) (curObj runtime.Object, oldObj runtim
 		if err != nil {
 			return nil, nil, err
 		}
+	} else {
+		// For DELETE events, create a minimal object with metadata from the key
+		// This will be populated further if we can decode prevValue
+		namespace, name := parseObjectIdentityFromKey(e.key)
+		klog.V(4).Infof("Creating minimal object for DELETE: key=%s, namespace=%s, name=%s", e.key, namespace, name)
+		if namespace != "" || name != "" {
+			curObj = wc.watcher.newFunc()
+			accessor, err := meta.Accessor(curObj)
+			if err == nil {
+				accessor.SetNamespace(namespace)
+				accessor.SetName(name)
+				klog.V(4).Infof("Successfully created minimal object: %T", curObj)
+			} else {
+				klog.Errorf("Failed to get accessor for minimal object: %v", err)
+			}
+		} else {
+			klog.Errorf("Failed to parse namespace/name from key: %s", e.key)
+		}
 	}
 	// We need to decode prevValue, only if this is deletion event or
 	// the underlying filter doesn't accept all objects (otherwise we
@@ -721,13 +754,27 @@ func (wc *watchChan) prepareObjs(e *event) (curObj runtime.Object, oldObj runtim
 	if len(e.prevValue) > 0 && (e.isDeleted || !wc.acceptAll()) {
 		data, _, err := wc.watcher.transformer.TransformFromStorage(wc.ctx, e.prevValue, authenticatedDataString(e.key))
 		if err != nil {
-			return nil, nil, wc.watcher.transformIfCorruptObjectError(e, err)
-		}
-		// Note that this sends the *old* object with the etcd revision for the time at
-		// which it gets deleted.
-		oldObj, err = decodeObj(wc.watcher.codec, wc.watcher.versioner, data, e.rev)
-		if err != nil {
-			return nil, nil, wc.watcher.transformIfCorruptObjectError(e, err)
+			if e.isDeleted {
+				// For deleted objects with corrupt data, log and continue with nil oldObj
+				// This ensures the DELETE event is sent to clients
+				klog.V(2).Infof("Corrupt object deleted, sending DELETE event without old object data: key=%s, err=%v", e.key, err)
+				// oldObj remains nil, DELETE event will be sent normally
+			} else {
+				return nil, nil, wc.watcher.transformIfCorruptObjectError(e, err)
+			}
+		} else {
+			// Note that this sends the *old* object with the etcd revision for the time at
+			// which it gets deleted.
+			oldObj, err = decodeObj(wc.watcher.codec, wc.watcher.versioner, data, e.rev)
+			if err != nil {
+				if e.isDeleted {
+					// For deleted objects with corrupt data, log and continue with nil oldObj
+					klog.V(2).Infof("Corrupt object deleted, sending DELETE event without old object data: key=%s, err=%v", e.key, err)
+					// oldObj remains nil, DELETE event will be sent normally
+				} else {
+					return nil, nil, wc.watcher.transformIfCorruptObjectError(e, err)
+				}
+			}
 		}
 	}
 	return curObj, oldObj, nil
@@ -735,6 +782,12 @@ func (wc *watchChan) prepareObjs(e *event) (curObj runtime.Object, oldObj runtim
 
 type corruptObjectDeletedError struct {
 	err error
+	key string
+	rv  int64
+}
+
+func (e *corruptObjectDeletedError) ToMessage() string {
+	return fmt.Sprintf("%s:%d", e.key, e.rv)
 }
 
 func (e *corruptObjectDeletedError) Error() string {
@@ -748,11 +801,47 @@ func (w *watcher) transformIfCorruptObjectError(e *event, err error) error {
 		return err
 	}
 
-	// if we are here it means we received a DELETED event but the object
-	// associated with it is corrupt because we failed to transform or
-	// decode the data associated with the object.
 	// wrap the original error so we can send a proper watch Error event.
-	return &corruptObjectDeletedError{err: corruptObjErr}
+	return &corruptObjectDeletedError{
+		err: corruptObjErr,
+		key: e.key,
+		rv:  e.rev,
+	}
+}
+
+// parseObjectIdentityFromKey extracts namespace and name from an etcd key.
+// Expected key format: [/{prefix}]/registry/{resource}/{namespace}/{name} or [/{prefix}]/registry/{resource}/{name}
+// where {prefix} is optional (e.g., a UUID for storage prefixes)
+// Returns empty strings if parsing fails.
+func parseObjectIdentityFromKey(key string) (namespace, name string) {
+	parts := strings.Split(strings.TrimPrefix(key, "/"), "/")
+
+	// Find the "registry" part
+	registryIdx := -1
+	for i, part := range parts {
+		if part == "registry" {
+			registryIdx = i
+			break
+		}
+	}
+
+	if registryIdx == -1 || registryIdx+1 >= len(parts) {
+		// No "registry" found or no resource type after it
+		return "", ""
+	}
+
+	// Skip "registry" and resource type
+	parts = parts[registryIdx+2:]
+
+	if len(parts) == 2 {
+		// Namespaced resource: /registry/{resource}/{namespace}/{name}
+		return parts[0], parts[1]
+	} else if len(parts) == 1 {
+		// Cluster-scoped resource: /registry/{resource}/{name}
+		return "", parts[0]
+	}
+
+	return "", ""
 }
 
 func decodeObj(codec runtime.Codec, versioner storage.Versioner, data []byte, rev int64) (_ runtime.Object, err error) {

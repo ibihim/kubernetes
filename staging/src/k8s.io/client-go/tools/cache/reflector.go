@@ -175,7 +175,7 @@ type ResourceVersionUpdater interface {
 // should be offloaded.
 type WatchErrorHandler func(r *Reflector, err error)
 
-// The WatchErrorHandler is called whenever ListAndWatch drops the
+// The WatchErrorHandlerWithContext is called whenever ListAndWatch drops the
 // connection with an error. After calling this handler, the informer
 // will backoff and retry.
 //
@@ -362,11 +362,9 @@ func (r *Reflector) RunWithContext(ctx context.Context) {
 	logger.V(3).Info("Stopping reflector", "type", r.typeDescription, "resyncPeriod", r.resyncPeriod, "reflector", r.name)
 }
 
-var (
-	// Used to indicate that watching stopped because of a signal from the stop
-	// channel passed in from a client of the reflector.
-	errorStopRequested = errors.New("stop requested")
-)
+// Used to indicate that watching stopped because of a signal from the stop
+// channel passed in from a client of the reflector.
+var errorStopRequested = errors.New("stop requested")
 
 // resyncChan returns a channel which will receive something when a resync is
 // required, and a cleanup function.
@@ -895,7 +893,13 @@ loop:
 				break loop
 			}
 			if event.Type == watch.Error {
-				return watchListBookmarkReceived, apierrors.FromObject(event.Object)
+				err := apierrors.FromObject(event.Object)
+				// Try to handle corrupt object deletion with smart cache recovery
+				if handleCorruptObjectDeletion(err, store, name) {
+					// Successfully handled, continue watching
+					continue
+				}
+				return watchListBookmarkReceived, err
 			}
 			if expectedType != nil {
 				if e, a := expectedType, reflect.TypeOf(event.Object); e != a {
@@ -1172,6 +1176,78 @@ type noopTicker struct{}
 func (t *noopTicker) C() <-chan time.Time { return nil }
 
 func (t *noopTicker) Stop() {}
+
+// handleCorruptObjectDeletion attempts to handle a corrupt object deletion
+// error by extracting metadata and updating the cache without a full re-list.
+// Returns true if the error was handled successfully, false otherwise.
+func handleCorruptObjectDeletion(err error, store ReflectorStore, reflectorName string) bool {
+	statusErr, ok := err.(*apierrors.StatusError)
+	if !ok {
+		return false
+	}
+
+	// Check if this is a corrupt object deletion error
+	if statusErr.ErrStatus.Reason != metav1.StatusReasonStoreReadError {
+		return false
+	}
+
+	if statusErr.ErrStatus.Details == nil {
+		return false
+	}
+
+	// Look for corrupt object deleted cause
+	for _, cause := range statusErr.ErrStatus.Details.Causes {
+		if cause.Type != metav1.CauseTypeCorruptObjectDeleted {
+			continue
+		}
+
+		namespace, name, rv, err := parseCorruptObjectMetadata(cause.Message)
+		if err != nil {
+			klog.V(4).Infof("Failed to parse corrupt object metadata for reflector %s: %v", reflectorName, err)
+			return false
+		}
+
+		// Use official Kubernetes ObjectName to construct the cache key
+		objName := NewObjectName(namespace, name)
+		key := objName.String()
+
+		// Create tombstone with nil Obj (we don't have the full object)
+		tombstone := DeletedFinalStateUnknown{
+			Key: key,
+			Obj: nil,
+		}
+
+		// Queue the deletion via tombstone
+		if err := store.Delete(tombstone); err != nil {
+			klog.V(2).Infof("Tombstone deletion failed for %s (etcd-rev=%s), triggering re-list: %v",
+				key, rv, err)
+			return false
+		}
+
+		klog.V(2).Infof("Recovered from corrupt object deletion via tombstone (key=%s, etcd-rev=%s)",
+			key, rv)
+		return true
+	}
+
+	return false
+}
+
+// parseCorruptObjectMetadata parses the encoded metadata from the error cause.
+// Expected formats:
+// - Namespaced: "namespace:name:resourceVersion"
+// - Cluster-scoped: "name:resourceVersion"
+func parseCorruptObjectMetadata(msg string) (namespace, name, rv string, err error) {
+	parts := strings.Split(msg, ":")
+	if len(parts) == 3 {
+		// Namespaced resource
+		return parts[0], parts[1], parts[2], nil
+	} else if len(parts) == 2 {
+		// Cluster-scoped resource
+		return "", parts[0], parts[1], nil
+	}
+
+	return "", "", "", fmt.Errorf("invalid metadata format: %s", msg)
+}
 
 // VeryShortWatchError is returned when the watch result channel is closed
 // within one second, without having sent any events.

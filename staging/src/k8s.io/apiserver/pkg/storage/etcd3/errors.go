@@ -23,27 +23,43 @@ import (
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apiserver/pkg/storage"
+	"k8s.io/klog/v2"
 
 	etcdrpc "go.etcd.io/etcd/api/v3/v3rpc/rpctypes"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 )
 
 func interpretWatchError(err error) error {
-	switch {
-	case err == etcdrpc.ErrCompacted:
-		return errors.NewResourceExpired("The resourceVersion for the provided watch is too old.")
+	switch err {
+	case etcdrpc.ErrCompacted:
+		return errors.NewResourceExpired(
+			"The resourceVersion for the provided watch is too old.",
+		)
 	}
 
 	var corruptobjDeletedErr *corruptObjectDeletedError
 	if goerrors.As(err, &corruptobjDeletedErr) {
-		return &errors.StatusError{
-			ErrStatus: metav1.Status{
-				Status:  metav1.StatusFailure,
-				Code:    http.StatusInternalServerError,
-				Reason:  metav1.StatusReasonStoreReadError,
-				Message: corruptobjDeletedErr.Error(),
+		klog.V(2).Infof(
+			"interpretWatchError: found corruptObjectDeletedError - key=%s, rv=%d",
+			corruptobjDeletedErr.key, corruptobjDeletedErr.rv,
+		)
+
+		status := metav1.Status{
+			Status:  metav1.StatusFailure,
+			Code:    http.StatusInternalServerError,
+			Reason:  metav1.StatusReasonStoreReadError,
+			Message: corruptobjDeletedErr.Error(),
+			Details: &metav1.StatusDetails{
+				Causes: []metav1.StatusCause{
+					{
+						Type:    metav1.CauseTypeCorruptObjectDeleted,
+						Message: corruptobjDeletedErr.ToMessage(),
+					},
+				},
 			},
 		}
+
+		return &errors.StatusError{ErrStatus: status}
 	}
 
 	return err
@@ -63,7 +79,11 @@ const (
 		"and now may show up in the list."
 )
 
-func interpretListError(err error, paging bool, continueKey, keyPrefix string) error {
+func interpretListError(
+	err error,
+	paging bool,
+	continueKey, keyPrefix string,
+) error {
 	switch {
 	case err == etcdrpc.ErrCompacted:
 		if paging {
