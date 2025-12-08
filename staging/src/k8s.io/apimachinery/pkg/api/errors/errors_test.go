@@ -703,3 +703,45 @@ func BenchmarkIsNotFoundWrappedErrors(b *testing.B) {
 		}
 	})
 }
+
+// TestStoreReadErrorClassification verifies that StatusReasonStoreReadError
+// is classified correctly. This is critical for the corrupt object deletion
+// flow: when a corrupt object is deleted, the watch receives an error with
+// StatusReasonStoreReadError. The Reflector's watch() function checks
+// IsInternalError() to decide whether to retry internally. Since StoreReadError
+// is in knownReasons, IsInternalError() returns false, causing the Reflector
+// to return nil and trigger a full cache rebuild.
+func TestStoreReadErrorClassification(t *testing.T) {
+	err := &StatusError{
+		ErrStatus: metav1.Status{
+			Status:  metav1.StatusFailure,
+			Code:    http.StatusInternalServerError,
+			Reason:  metav1.StatusReasonStoreReadError,
+			Message: "saw a DELETED event, but object data is corrupt",
+		},
+	}
+
+	// IsStoreReadError should return true
+	if !IsStoreReadError(err) {
+		t.Error("expected IsStoreReadError(err) to return true")
+	}
+
+	// IsInternalError should return false because StoreReadError is in knownReasons.
+	// This is the critical behavior that causes the Reflector to NOT retry internally
+	// and instead return nil, triggering a full cache rebuild.
+	if IsInternalError(err) {
+		t.Error("expected IsInternalError(err) to return false for StoreReadError (it's a known reason)")
+	}
+
+	// Verify that an unknown reason with 500 code IS considered internal error
+	unknownErr := &StatusError{
+		ErrStatus: metav1.Status{
+			Status: metav1.StatusFailure,
+			Code:   http.StatusInternalServerError,
+			Reason: metav1.StatusReasonUnknown,
+		},
+	}
+	if !IsInternalError(unknownErr) {
+		t.Error("expected IsInternalError(unknownErr) to return true for unknown reason with 500 code")
+	}
+}

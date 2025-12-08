@@ -580,6 +580,230 @@ func TestListCorruptObjects(t *testing.T) {
 	}
 }
 
+// TestCorruptObjectDeleteTriggersWatcherReconnect verifies that when a corrupt
+// object is deleted using the unsafe delete option, watching clients (informers)
+// rebuild their cache from scratch. This tests the flow documented in
+// CORRUPT_OBJECT_FLOW_WALKTHROUGH.md:
+//
+// 1. Backend Reflector receives watch.Error with StatusReasonStoreReadError
+// 2. Cacher calls terminateAllWatchers() during reinitialize
+// 3. Client informers see their watch channel close
+// 4. Client informers reconnect, get "too old resource version" error
+// 5. Client informers do a fresh LIST and rebuild their cache
+func TestCorruptObjectDeleteTriggersWatcherReconnect(t *testing.T) {
+	featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, genericfeatures.AllowUnsafeMalformedObjectDeletion, true)
+
+	test, err := newTransformTest(t, transformTestConfig{
+		transformerConfigYAML: aesGCMConfigYAML,
+		reload:                true,
+	})
+	if err != nil {
+		t.Fatalf("failed to setup test: %v", err)
+	}
+	defer test.cleanUp()
+
+	ctx := context.Background()
+
+	// a) Grant the admin user permission to do unsafe delete
+	permitUserToDoVerbOnSecret(t, test.restClient, "admin", testNamespace, []string{"create", "get", "delete", "update", "unsafe-delete-ignore-read-errors"})
+
+	// b) Create a secret that will become corrupt
+	corruptSecretName := "will-be-corrupt"
+	_, err = test.createSecret(corruptSecretName, testNamespace)
+	if err != nil {
+		t.Fatalf("failed to create secret: %v", err)
+	}
+
+	// c) Set up informer to watch secrets (simulates client-side Reflector/cache)
+	factory := informers.NewSharedInformerFactoryWithOptions(test.restClient, 0,
+		informers.WithNamespace(testNamespace))
+	informer := factory.Core().V1().Secrets().Informer()
+
+	// Add empty event handler to ensure informer processes events
+	informer.AddEventHandler(cache.ResourceEventHandlerFuncs{})
+
+	stopCh := make(chan struct{})
+	defer close(stopCh)
+	factory.Start(stopCh)
+
+	// Wait for initial sync
+	if !cache.WaitForCacheSync(ctx.Done(), informer.HasSynced) {
+		t.Fatal("informer failed to sync")
+	}
+
+	// Record the initial resourceVersion
+	initialRV := informer.LastSyncResourceVersion()
+	t.Logf("Initial informer ResourceVersion: %s", initialRV)
+
+	// d) Verify secret is in cache before corruption
+	_, err = factory.Core().V1().Secrets().Lister().Secrets(testNamespace).Get(corruptSecretName)
+	if err != nil {
+		t.Fatalf("secret should be in cache before corruption: %v", err)
+	}
+
+	// e) Break encryption by swapping config file (same pattern as TestAllowUnsafeMalformedObjectDeletionFeature)
+	now := time.Now()
+	encryptionConf := filepath.Join(test.configDir, encryptionConfigFileName)
+	if err := os.WriteFile(encryptionConf, []byte(aesCBCConfigYAML), 0o644); err != nil {
+		t.Fatalf("failed to write new encryption config: %v", err)
+	}
+
+	// f) Wait for encryption to break (GET returns InternalError)
+	err = wait.PollUntilContextTimeout(ctx, 1*time.Second, 2*time.Minute, true, func(ctx context.Context) (bool, error) {
+		_, err := test.restClient.CoreV1().Secrets(testNamespace).Get(ctx, corruptSecretName, metav1.GetOptions{})
+		if err != nil {
+			var apiStatus apierrors.APIStatus
+			if errors.As(err, &apiStatus) && apiStatus.Status().Reason == metav1.StatusReasonInternalError {
+				return true, nil
+			}
+		}
+		return false, nil
+	})
+	if err != nil {
+		t.Fatalf("encryption never broke: %v", err)
+	}
+	t.Logf("Encryption broke after %s", time.Since(now))
+
+	// g) Delete the corrupt object with unsafe option
+	options := metav1.DeleteOptions{
+		IgnoreStoreReadErrorWithClusterBreakingPotential: ptr.To(true),
+	}
+	err = test.restClient.CoreV1().Secrets(testNamespace).Delete(ctx, corruptSecretName, options)
+	if err != nil {
+		t.Fatalf("unsafe delete failed: %v", err)
+	}
+	t.Log("Corrupt object deleted successfully")
+
+	// h) Verify informer rebuilt its cache (LastSyncResourceVersion should change)
+	// The flow is: corrupt object delete -> watch.Error -> Cacher reinitialize ->
+	// terminateAllWatchers() -> informer reconnects -> gets "too old" error -> fresh LIST
+	err = wait.PollUntilContextTimeout(ctx, 100*time.Millisecond, 30*time.Second, true, func(ctx context.Context) (bool, error) {
+		newRV := informer.LastSyncResourceVersion()
+		if newRV != initialRV && newRV != "" {
+			t.Logf("Informer ResourceVersion changed: %s -> %s (cache rebuilt)", initialRV, newRV)
+			return true, nil
+		}
+		return false, nil
+	})
+	if err != nil {
+		t.Errorf("informer did not rebuild cache (ResourceVersion unchanged from %s): %v", initialRV, err)
+	}
+
+	// i) Verify corrupt object is NOT in the informer cache after rebuild
+	_, err = factory.Core().V1().Secrets().Lister().Secrets(testNamespace).Get(corruptSecretName)
+	if !apierrors.IsNotFound(err) {
+		t.Errorf("expected corrupt object to be removed from cache, got error: %v", err)
+	} else {
+		t.Log("Corrupt object correctly removed from informer cache after rebuild")
+	}
+}
+
+// TestMultipleWatchersDisconnectedOnCorruptDelete verifies that when a corrupt
+// object is deleted, ALL watching clients (not just one) have their watches
+// terminated and rebuild their caches. This confirms the terminateAllWatchers()
+// behavior documented in CORRUPT_OBJECT_FLOW_WALKTHROUGH.md.
+func TestMultipleWatchersDisconnectedOnCorruptDelete(t *testing.T) {
+	featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, genericfeatures.AllowUnsafeMalformedObjectDeletion, true)
+
+	test, err := newTransformTest(t, transformTestConfig{
+		transformerConfigYAML: aesGCMConfigYAML,
+		reload:                true,
+	})
+	if err != nil {
+		t.Fatalf("failed to setup test: %v", err)
+	}
+	defer test.cleanUp()
+
+	ctx := context.Background()
+
+	// Grant permissions
+	permitUserToDoVerbOnSecret(t, test.restClient, "admin", testNamespace, []string{"create", "get", "delete", "update", "unsafe-delete-ignore-read-errors"})
+
+	// Create a secret that will become corrupt
+	corruptSecretName := "will-be-corrupt-multi"
+	_, err = test.createSecret(corruptSecretName, testNamespace)
+	if err != nil {
+		t.Fatalf("failed to create secret: %v", err)
+	}
+
+	// Set up MULTIPLE independent informers (simulating multiple clients)
+	const numWatchers = 3
+	factories := make([]informers.SharedInformerFactory, numWatchers)
+	watcherInformers := make([]cache.SharedIndexInformer, numWatchers)
+	initialRVs := make([]string, numWatchers)
+	stopChs := make([]chan struct{}, numWatchers)
+
+	for i := 0; i < numWatchers; i++ {
+		factories[i] = informers.NewSharedInformerFactoryWithOptions(test.restClient, 0,
+			informers.WithNamespace(testNamespace))
+		watcherInformers[i] = factories[i].Core().V1().Secrets().Informer()
+		stopChs[i] = make(chan struct{})
+		defer close(stopChs[i])
+		factories[i].Start(stopChs[i])
+	}
+
+	// Wait for all informers to sync
+	for i := 0; i < numWatchers; i++ {
+		if !cache.WaitForCacheSync(ctx.Done(), watcherInformers[i].HasSynced) {
+			t.Fatalf("informer %d failed to sync", i)
+		}
+		initialRVs[i] = watcherInformers[i].LastSyncResourceVersion()
+		t.Logf("Informer %d initial RV: %s", i, initialRVs[i])
+	}
+
+	// Break encryption
+	encryptionConf := filepath.Join(test.configDir, encryptionConfigFileName)
+	if err := os.WriteFile(encryptionConf, []byte(aesCBCConfigYAML), 0o644); err != nil {
+		t.Fatalf("failed to write new encryption config: %v", err)
+	}
+
+	// Wait for encryption to break
+	err = wait.PollUntilContextTimeout(ctx, 1*time.Second, 2*time.Minute, true, func(ctx context.Context) (bool, error) {
+		_, err := test.restClient.CoreV1().Secrets(testNamespace).Get(ctx, corruptSecretName, metav1.GetOptions{})
+		if err != nil {
+			var apiStatus apierrors.APIStatus
+			if errors.As(err, &apiStatus) && apiStatus.Status().Reason == metav1.StatusReasonInternalError {
+				return true, nil
+			}
+		}
+		return false, nil
+	})
+	if err != nil {
+		t.Fatalf("encryption never broke: %v", err)
+	}
+
+	// Delete the corrupt object
+	options := metav1.DeleteOptions{
+		IgnoreStoreReadErrorWithClusterBreakingPotential: ptr.To(true),
+	}
+	err = test.restClient.CoreV1().Secrets(testNamespace).Delete(ctx, corruptSecretName, options)
+	if err != nil {
+		t.Fatalf("unsafe delete failed: %v", err)
+	}
+
+	// Verify ALL informers rebuilt their cache
+	rebuiltCount := 0
+	err = wait.PollUntilContextTimeout(ctx, 100*time.Millisecond, 30*time.Second, true, func(ctx context.Context) (bool, error) {
+		rebuiltCount = 0
+		for i := 0; i < numWatchers; i++ {
+			newRV := watcherInformers[i].LastSyncResourceVersion()
+			if newRV != initialRVs[i] && newRV != "" {
+				rebuiltCount++
+			}
+		}
+		return rebuiltCount == numWatchers, nil
+	})
+
+	if rebuiltCount != numWatchers {
+		t.Errorf("expected all %d informers to rebuild cache, but only %d did", numWatchers, rebuiltCount)
+		for i := 0; i < numWatchers; i++ {
+			t.Logf("  Informer %d: initial=%s, current=%s", i, initialRVs[i], watcherInformers[i].LastSyncResourceVersion())
+		}
+	} else {
+		t.Logf("All %d informers successfully rebuilt their cache (terminateAllWatchers worked)", numWatchers)
+	}
+}
+
 func permitUserToDoVerbOnSecret(t *testing.T, client *clientset.Clientset, user, namespace string, verbs []string) {
 	t.Helper()
 
