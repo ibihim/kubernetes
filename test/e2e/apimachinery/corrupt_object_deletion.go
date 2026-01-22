@@ -47,6 +47,8 @@ const (
 
 	// corruptedEncryptionConfig uses a different encryption provider (aescbc) than the
 	// original config (aesgcm), making secrets encrypted with the original config unreadable.
+	// Note: The AESCBC key must be exactly 16, 24, or 32 bytes (for AES-128/192/256).
+	// "1234567890123456" is exactly 16 bytes.
 	corruptedEncryptionConfig = `apiVersion: apiserver.config.k8s.io/v1
 kind: EncryptionConfiguration
 resources:
@@ -56,7 +58,7 @@ resources:
     - aescbc:
         keys:
         - name: key2
-          secret: YW5vdGhlciBzZWNyZXQga2V5IQ==
+          secret: MTIzNDU2Nzg5MDEyMzQ1Ng==
     - identity: {}`
 
 )
