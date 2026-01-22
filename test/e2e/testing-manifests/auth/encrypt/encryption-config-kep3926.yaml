@@ -1,0 +1,26 @@
+# Initial encryption configuration for KEP-3926 E2E tests.
+#
+# This config uses AESGCM encryption for secrets. During the test, this config
+# will be replaced with a different encryption provider (AESCBC) to simulate
+# corruption - making existing secrets unreadable because they were encrypted
+# with a different algorithm/key.
+#
+# The test flow:
+# 1. Start cluster with this config (AESGCM + key1)
+# 2. Create a secret (encrypted with AESGCM)
+# 3. Replace config with AESCBC + key2
+# 4. Secret becomes "corrupt" (can't decrypt AESGCM data with AESCBC)
+# 5. Test the IgnoreStoreReadErrorWithClusterBreakingPotential delete option
+#
+apiVersion: apiserver.config.k8s.io/v1
+kind: EncryptionConfiguration
+resources:
+  - resources:
+    - secrets
+    providers:
+    - aesgcm:
+        keys:
+        - name: key1
+          # base64 encoded: "secret is secure" (16 bytes for AES-128)
+          secret: c2VjcmV0IGlzIHNlY3VyZQ==
+    - identity: {}

@@ -1,0 +1,75 @@
+# Kind cluster configuration for KEP-3926 (AllowUnsafeMalformedObjectDeletion) E2E tests.
+#
+# Key differences from the standard kind.yaml:
+# 1. Encryption config is mounted read-write (not read-only) to allow hot-reload testing
+# 2. encryption-provider-config-automatic-reload is enabled
+# 3. AllowUnsafeMalformedObjectDeletion feature gate is enabled
+# 4. Uses simpler AESGCM encryption (no KMS plugin required)
+#
+# Usage:
+#   kind create cluster --config test/e2e/testing-manifests/auth/encrypt/kind-kep3926.yaml
+#
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+nodes:
+- role: control-plane
+  extraMounts:
+  # Mount encryption config as read-write to allow hot-reload during tests
+  - containerPath: /etc/kubernetes/encryption-config.yaml
+    hostPath: test/e2e/testing-manifests/auth/encrypt/encryption-config-kep3926.yaml
+    readOnly: false
+    propagation: None
+  kubeadmConfigPatches:
+    # v1beta4 for the future (v1.35.0+ ?)
+    # https://github.com/kubernetes-sigs/kind/issues/3847
+    # TODO: drop v1beta3 when kind makes the switch
+    - |
+      kind: ClusterConfiguration
+      apiVersion: kubeadm.k8s.io/v1beta4
+      apiServer:
+        extraArgs:
+          - name: "encryption-provider-config"
+            value: "/etc/kubernetes/encryption-config.yaml"
+          - name: "encryption-provider-config-automatic-reload"
+            value: "true"
+          - name: "feature-gates"
+            value: "AllowUnsafeMalformedObjectDeletion=true"
+          - name: "v"
+            value: "5"
+        extraVolumes:
+        - name: encryption-config
+          hostPath: "/etc/kubernetes/encryption-config.yaml"
+          mountPath: "/etc/kubernetes/encryption-config.yaml"
+          readOnly: false
+          pathType: File
+      scheduler:
+        extraArgs:
+          - name: "v"
+            value: "5"
+      controllerManager:
+        extraArgs:
+          - name: "v"
+            value: "5"
+    # v1beta3 for v1.23.0 ... ?
+    - |
+      kind: ClusterConfiguration
+      apiVersion: kubeadm.k8s.io/v1beta3
+      apiServer:
+        extraArgs:
+          encryption-provider-config: "/etc/kubernetes/encryption-config.yaml"
+          encryption-provider-config-automatic-reload: "true"
+          feature-gates: "AllowUnsafeMalformedObjectDeletion=true"
+          v: "5"
+        extraVolumes:
+        - name: encryption-config
+          hostPath: "/etc/kubernetes/encryption-config.yaml"
+          mountPath: "/etc/kubernetes/encryption-config.yaml"
+          readOnly: false
+          pathType: File
+      scheduler:
+        extraArgs:
+          v: "5"
+      controllerManager:
+        extraArgs:
+          v: "5"
+- role: worker

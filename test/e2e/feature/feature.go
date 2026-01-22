@@ -28,6 +28,12 @@ var (
 	// TODO: document the feature (owning SIG, when to use this feature for a test)
 	APIServerIdentity = framework.WithFeature(framework.ValidFeatures.Add("APIServerIdentity"))
 
+	// Owner: sig-auth
+	// kep: https://kep.k8s.io/3926
+	// Marks tests that require the AllowUnsafeMalformedObjectDeletion feature gate
+	// to be enabled for deleting corrupt/undecryptable resources.
+	AllowUnsafeMalformedObjectDeletion = framework.WithFeature(framework.ValidFeatures.Add("AllowUnsafeMalformedObjectDeletion"))
+
 	// Owner: sig-lifecycle
 	// This label is used for tests which need the following controllers to be enabled:
 	// - bootstrap-signer-controller
