@@ -78,6 +78,20 @@ resources:
         - name: key1
           secret: c2VjcmV0IGlzIHNlY3VyZQ==
 `
+
+	// crIdentityConfigYAML uses the identity (no-op) provider.
+	// Data passes through the transformer unchanged, so any
+	// corruption introduced in etcd will reach the decoder intact,
+	// triggering "undecodable" errors instead of "untransformable".
+	crIdentityConfigYAML = `
+kind: EncryptionConfiguration
+apiVersion: apiserver.config.k8s.io/v1
+resources:
+  - resources:
+    - foos.cr.bar.com
+    providers:
+    - identity: {}
+`
 )
 
 var fooGVR = schema.GroupVersionResource{Group: "cr.bar.com", Version: "v1", Resource: "foos"}
@@ -506,6 +520,225 @@ func TestCRListCorruptObjects(t *testing.T) {
 			// e) LIST should return expected error
 			_, err = adminDynClient.Resource(fooGVR).Namespace(testNamespace).List(ctx, metav1.ListOptions{})
 			tc.listAfter.verify(t, err)
+		})
+	}
+}
+
+// TestCRBitFlipCorruptObjectDeletion exercises the decoder error path for
+// KEP-3926. Unlike TestCRAllowUnsafeMalformedObjectDeletionFeature which
+// tests transformer errors (wrong encryption config → "untransformable"),
+// this test uses an identity (no-op) encryption provider and corrupts the
+// stored JSON by flipping bits directly in etcd. The corrupted bytes pass
+// through the identity transformer unchanged but fail at the decoder layer,
+// producing "undecodable" errors instead of "untransformable" errors.
+//
+// The identity provider is required here because bit-flipping raw etcd bytes
+// under a real encryption provider (e.g. AES-GCM) would corrupt the
+// ciphertext, causing the transformer to reject it before the decoder ever
+// sees it — that's the "untransformable" path already covered by the other
+// test. To isolate the decoder error path, we need the transformer to be a
+// no-op so the corrupted bytes pass through it unchanged and reach the
+// codec, which then fails to deserialize them.
+func TestCRBitFlipCorruptObjectDeletion(t *testing.T) {
+	tests := []struct {
+		featureEnabled                        bool
+		encryptionBrokenFn                    func(t *testing.T, got apierrors.APIStatus) bool
+		corruptObjGetPreDelete                verifier
+		corrupObjDeletWithoutOption           verifier
+		corrupObjDeleteWithOption             verifier
+		corrupObjDeleteWithOptionAndPrivilege verifier
+		corrupObjGetPostDelete                verifier
+		corrupObjGetFromListerCachePostDelete verifier
+	}{
+		{
+			featureEnabled: true,
+			encryptionBrokenFn: func(t *testing.T, got apierrors.APIStatus) bool {
+				return got.Status().Reason == metav1.StatusReasonInternalError &&
+					strings.Contains(got.Status().Message, "Internal error occurred: StorageError: corrupt object") &&
+					strings.Contains(got.Status().Message, "object not decodable")
+			},
+			corruptObjGetPreDelete:      wantAPIStatusError{reason: metav1.StatusReasonInternalError},
+			corrupObjDeletWithoutOption: wantAPIStatusError{reason: metav1.StatusReasonInternalError},
+			corrupObjDeleteWithOption: wantAPIStatusError{
+				reason:          metav1.StatusReasonForbidden,
+				messageContains: `not permitted to do "unsafe-delete-ignore-read-errors"`,
+			},
+			corrupObjDeleteWithOptionAndPrivilege: wantNoError{},
+			corrupObjGetPostDelete:                wantAPIStatusError{reason: metav1.StatusReasonNotFound},
+			corrupObjGetFromListerCachePostDelete: wantAPIStatusError{reason: metav1.StatusReasonNotFound},
+		},
+		{
+			featureEnabled: false,
+			encryptionBrokenFn: func(t *testing.T, got apierrors.APIStatus) bool {
+				// Without the feature gate, the decoder wrapper is not applied,
+				// so the raw decode error propagates without "corrupt object" wrapping.
+				return got.Status().Reason == metav1.StatusReasonInternalError &&
+					!strings.Contains(got.Status().Message, "corrupt object")
+			},
+			corruptObjGetPreDelete:                wantAPIStatusError{reason: metav1.StatusReasonInternalError},
+			corrupObjDeletWithoutOption:           wantAPIStatusError{reason: metav1.StatusReasonInternalError},
+			corrupObjDeleteWithOption:             wantAPIStatusError{reason: metav1.StatusReasonInternalError},
+			corrupObjDeleteWithOptionAndPrivilege: wantAPIStatusError{reason: metav1.StatusReasonInternalError},
+			corrupObjGetPostDelete:                wantAPIStatusError{reason: metav1.StatusReasonInternalError},
+			corrupObjGetFromListerCachePostDelete: wantNoError{},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(fmt.Sprintf("%s/%t", string(genericfeatures.AllowUnsafeMalformedObjectDeletion), tc.featureEnabled), func(t *testing.T) {
+			featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, genericfeatures.AllowUnsafeMalformedObjectDeletion, tc.featureEnabled)
+
+			// Identity provider: no-op transformer, no config reload needed.
+			test, err := newTransformTest(t, transformTestConfig{transformerConfigYAML: crIdentityConfigYAML, reload: false})
+			if err != nil {
+				t.Fatalf("failed to setup test, error was %v", err)
+			}
+			defer test.cleanUp()
+
+			// Register the foos CRD
+			etcd.CreateTestCRDs(t, apiextensionsclientset.NewForConfigOrDie(test.kubeAPIServer.ClientConfig), false, etcd.GetCustomResourceDefinitionData()[0:1]...)
+
+			// a) set up a distinct client for the test user with the least privileges
+			testUser := "croc"
+			testUserConfig := restclient.CopyConfig(test.kubeAPIServer.ClientConfig)
+			testUserConfig.Impersonate.UserName = testUser
+			testUserDynClient := dynamic.NewForConfigOrDie(testUserConfig)
+			adminClient := test.restClient
+			adminDynClient := dynamic.NewForConfigOrDie(test.kubeAPIServer.ClientConfig)
+
+			// b) grant the test user initial permissions on foos (not unsafe-delete yet)
+			permitUserToDoVerbOnCR(t, adminClient, testUser, testNamespace, []string{"create", "get", "delete", "update"}, "cr.bar.com", "foos")
+
+			fooCorrupt := "foo-with-unsafe-delete"
+			// c) create and delete the CR — no error expected
+			createFooCR(t, testUserDynClient, fooCorrupt, testNamespace)
+			err = testUserDynClient.Resource(fooGVR).Namespace(testNamespace).Delete(context.Background(), fooCorrupt, metav1.DeleteOptions{})
+			if err != nil {
+				t.Fatalf("'%s/%s' failed to delete, got error: %v", testNamespace, fooCorrupt, err)
+			}
+
+			// d) re-create the CR with a finalizer
+			fooObj := createFooCR(t, testUserDynClient, fooCorrupt, testNamespace)
+			unstructured.SetNestedStringSlice(fooObj.Object, []string{"test.k8s.io/fake"}, "metadata", "finalizers")
+			fooObj, err = testUserDynClient.Resource(fooGVR).Namespace(testNamespace).Update(context.Background(), fooObj, metav1.UpdateOptions{})
+			if err != nil {
+				t.Fatalf("Failed to add finalizer to the CR, error: %v", err)
+			}
+
+			// e) set up a dynamic informer to track the CR in the cache
+			factory := dynamicinformer.NewFilteredDynamicSharedInformerFactory(adminDynClient, time.Minute, testNamespace, nil)
+			informer := factory.ForResource(fooGVR)
+
+			finalEvent := make(chan struct{})
+			finalFooName := "final-foo"
+			_, err = informer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
+				AddFunc: func(obj interface{}) {
+					if accessor, err := meta.Accessor(obj); err == nil && accessor.GetName() == finalFooName {
+						close(finalEvent)
+					}
+				},
+			})
+			if err != nil {
+				t.Fatalf("unexpected error from AddEventHandler: %v", err)
+			}
+
+			lister := informer.Lister()
+			factory.Start(test.Done())
+			waitForSyncCtx, waitForSyncCancel := context.WithTimeout(context.Background(), wait.ForeverTestTimeout)
+			defer waitForSyncCancel()
+			if !cache.WaitForCacheSync(waitForSyncCtx.Done(), informer.Informer().HasSynced) {
+				t.Fatalf("caches failed to sync")
+			}
+
+			// f) the CR should be readable from the cache
+			if _, err := lister.ByNamespace(testNamespace).Get(fooCorrupt); err != nil {
+				t.Errorf("unexpected failure getting the CR from lister cache: %v", err)
+			}
+
+			// g) corrupt the CR by flipping a bit in the middle of its etcd value.
+			//    With the identity provider, the stored value is raw JSON — flipping
+			//    a byte makes it unparseable, which triggers a decoder error.
+			etcdPath := test.getETCDPathForResource(test.storageConfig.Prefix, "cr.bar.com", "foos", fooCorrupt, testNamespace)
+			resp, err := test.readRawRecordFromETCD(etcdPath)
+			if err != nil {
+				t.Fatalf("failed to read from etcd: %v", err)
+			}
+			if len(resp.Kvs) != 1 {
+				t.Fatalf("expected 1 key in etcd, got %d", len(resp.Kvs))
+			}
+			value := make([]byte, len(resp.Kvs[0].Value))
+			copy(value, resp.Kvs[0].Value)
+			value[len(value)/2] ^= 0xFF
+			if _, err := test.writeRawRecordToETCD(etcdPath, value); err != nil {
+				t.Fatalf("failed to write corrupted value to etcd: %v", err)
+			}
+
+			// h) poll until GET fails with the expected decode error — the corruption
+			//    is immediate (no config reload), but we poll for robustness.
+			testCtx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			err = wait.PollUntilContextTimeout(testCtx, 1*time.Second, 2*time.Minute, true, func(ctx context.Context) (done bool, err error) {
+				_, err = testUserDynClient.Resource(fooGVR).Namespace(testNamespace).Get(ctx, fooCorrupt, metav1.GetOptions{})
+				var got apierrors.APIStatus
+				if !errors.As(err, &got) {
+					return false, nil
+				}
+				if done := tc.encryptionBrokenFn(t, got); done {
+					return true, nil
+				}
+				return false, nil
+			})
+			if err != nil {
+				t.Fatalf("bit-flip corruption never took effect: %v", err)
+			}
+
+			// i) create a new CR, and then delete it — should work fine
+			fooNormal := "bar-with-normal-delete"
+			createFooCR(t, testUserDynClient, fooNormal, testNamespace)
+			err = testUserDynClient.Resource(fooGVR).Namespace(testNamespace).Delete(context.Background(), fooNormal, metav1.DeleteOptions{})
+			if err != nil {
+				t.Fatalf("'%s/%s' failed to delete, got error: %v", testNamespace, fooNormal, err)
+			}
+
+			// j) GET the corrupt CR — expect failure
+			_, err = testUserDynClient.Resource(fooGVR).Namespace(testNamespace).Get(context.Background(), fooCorrupt, metav1.GetOptions{})
+			tc.corruptObjGetPreDelete.verify(t, err)
+			if _, err := lister.ByNamespace(testNamespace).Get(fooCorrupt); err != nil {
+				t.Errorf("unexpected failure getting the CR from the cache: %v", err)
+			}
+
+			// k) normal delete — expect error
+			err = testUserDynClient.Resource(fooGVR).Namespace(testNamespace).Delete(context.Background(), fooCorrupt, metav1.DeleteOptions{})
+			tc.corrupObjDeletWithoutOption.verify(t, err)
+
+			// l) delete with unsafe option but no privilege — expect forbidden or internal error
+			options := metav1.DeleteOptions{
+				IgnoreStoreReadErrorWithClusterBreakingPotential: ptr.To[bool](true),
+			}
+			err = testUserDynClient.Resource(fooGVR).Namespace(testNamespace).Delete(context.Background(), fooCorrupt, options)
+			tc.corrupObjDeleteWithOption.verify(t, err)
+
+			// m) grant the test user the unsafe-delete-ignore-read-errors verb
+			permitUserToDoVerbOnCR(t, adminClient, testUser, testNamespace, []string{"unsafe-delete-ignore-read-errors"}, "cr.bar.com", "foos")
+
+			// n) try unsafe delete again — should succeed when feature enabled
+			err = testUserDynClient.Resource(fooGVR).Namespace(testNamespace).Delete(context.Background(), fooCorrupt, options)
+			tc.corrupObjDeleteWithOptionAndPrivilege.verify(t, err)
+
+			// o) final GET should return NotFound after deletion (when feature enabled)
+			_, err = testUserDynClient.Resource(fooGVR).Namespace(testNamespace).Get(context.Background(), fooCorrupt, metav1.GetOptions{})
+			tc.corrupObjGetPostDelete.verify(t, err)
+
+			// p) create the final CR and wait for the informer to catch up
+			createFooCR(t, adminDynClient, finalFooName, testNamespace)
+			select {
+			case <-finalEvent:
+			case <-time.After(wait.ForeverTestTimeout):
+				t.Fatalf("timed out waiting for the informer to catch up")
+			}
+
+			// q) read the corrupt object from the cache — should be gone when feature enabled
+			_, err = lister.ByNamespace(testNamespace).Get(fooCorrupt)
+			tc.corrupObjGetFromListerCachePostDelete.verify(t, err)
 		})
 	}
 }
