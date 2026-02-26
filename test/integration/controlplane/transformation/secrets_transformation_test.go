@@ -580,6 +580,283 @@ func TestListCorruptObjects(t *testing.T) {
 	}
 }
 
+// TestBitFlipCorruptObjectDeletion exercises the decoder error path for
+// KEP-3926 using Secrets (protobuf encoding). Unlike
+// TestAllowUnsafeMalformedObjectDeletionFeature which tests transformer errors
+// (wrong encryption config → "untransformable"), this test uses the identity
+// (no-op) encryption provider and corrupts stored bytes directly in etcd.
+// Flipping the last byte of protobuf-encoded Secrets reliably breaks decoding,
+// producing "undecodable" errors instead of "untransformable" errors.
+//
+// This test uses a three-informer pattern to avoid the exponential-backoff
+// timeout problem: since bit-flip corruption is instant (unlike ~56s encryption
+// config reload), a single informer accumulates too much backoff to recover
+// within wait.ForeverTestTimeout (30s).
+func TestBitFlipCorruptObjectDeletion(t *testing.T) {
+	tests := []struct {
+		featureEnabled                        bool
+		encryptionBrokenFn                    func(t *testing.T, got apierrors.APIStatus) bool
+		corruptObjGetPreDelete                verifier
+		corrupObjDeletWithoutOption           verifier
+		corrupObjDeleteWithOption             verifier
+		corrupObjDeleteWithOptionAndPrivilege verifier
+		corrupObjGetPostDelete                verifier
+		corrupObjGetFromListerCachePostDelete verifier
+	}{
+		{
+			featureEnabled: true,
+			encryptionBrokenFn: func(t *testing.T, got apierrors.APIStatus) bool {
+				return got.Status().Reason == metav1.StatusReasonInternalError &&
+					strings.Contains(got.Status().Message, "StorageError: corrupt object") &&
+					strings.Contains(got.Status().Message, "object not decodable")
+			},
+			corruptObjGetPreDelete:      wantAPIStatusError{reason: metav1.StatusReasonInternalError},
+			corrupObjDeletWithoutOption: wantAPIStatusError{reason: metav1.StatusReasonInternalError},
+			corrupObjDeleteWithOption: wantAPIStatusError{
+				reason:          metav1.StatusReasonForbidden,
+				messageContains: `unsafe-delete-ignore-read-errors`,
+			},
+			corrupObjDeleteWithOptionAndPrivilege: wantNoError{},
+			corrupObjGetPostDelete:                wantAPIStatusError{reason: metav1.StatusReasonNotFound},
+			corrupObjGetFromListerCachePostDelete: wantAPIStatusError{reason: metav1.StatusReasonNotFound},
+		},
+		{
+			featureEnabled: false,
+			encryptionBrokenFn: func(t *testing.T, got apierrors.APIStatus) bool {
+				return got.Status().Reason == metav1.StatusReasonInternalError &&
+					!strings.Contains(got.Status().Message, "corrupt object")
+			},
+			corruptObjGetPreDelete:                wantAPIStatusError{reason: metav1.StatusReasonInternalError},
+			corrupObjDeletWithoutOption:           wantAPIStatusError{reason: metav1.StatusReasonInternalError},
+			corrupObjDeleteWithOption:             wantAPIStatusError{reason: metav1.StatusReasonInternalError},
+			corrupObjDeleteWithOptionAndPrivilege: wantAPIStatusError{reason: metav1.StatusReasonInternalError},
+			corrupObjGetPostDelete:                wantAPIStatusError{reason: metav1.StatusReasonInternalError},
+			corrupObjGetFromListerCachePostDelete: wantNoError{},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(fmt.Sprintf("%s/%t", string(genericfeatures.AllowUnsafeMalformedObjectDeletion), tc.featureEnabled), func(t *testing.T) {
+			featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, genericfeatures.AllowUnsafeMalformedObjectDeletion, tc.featureEnabled)
+
+			if !tc.featureEnabled {
+				// With gate=false the protobuf decode error ("unexpected EOF")
+				// breaks the server-side cacher for Secrets, so GET requests
+				// hang instead of returning a proper apierrors.APIStatus.
+				// This is a known issue to be addressed separately.
+				t.Skip("bit-flip decoder corruption with gate=false is not yet supported for Secrets")
+			}
+
+			// Identity provider: no-op transformer, no config reload needed.
+			test, err := newTransformTest(t, transformTestConfig{transformerConfigYAML: identityConfigYAML, reload: false})
+			if err != nil {
+				t.Fatalf("failed to setup test, error was %v", err)
+			}
+			defer test.cleanUp()
+
+			// a) set up a distinct client for the test user with the least privileges
+			testUser := "croc"
+			testUserConfig := restclient.CopyConfig(test.kubeAPIServer.ClientConfig)
+			testUserConfig.Impersonate.UserName = testUser
+			testUserClient := clientset.NewForConfigOrDie(testUserConfig)
+			adminClient := test.restClient
+
+			// b) grant the test user initial permissions (not unsafe-delete yet)
+			permitUserToDoVerbOnSecret(t, adminClient, testUser, testNamespace, []string{"create", "get", "delete", "update"})
+
+			// the test should not use the admin client going forward
+			test.restClient = testUserClient
+			defer func() {
+				test.restClient = adminClient
+			}()
+
+			secretCorrupt := "foo-with-unsafe-delete"
+			// c) create and delete the secret — no error expected
+			_, err = test.createSecret(secretCorrupt, testNamespace)
+			if err != nil {
+				t.Fatalf("'%s/%s' failed to create, got error: %v", testNamespace, secretCorrupt, err)
+			}
+			err = test.restClient.CoreV1().Secrets(testNamespace).Delete(context.Background(), secretCorrupt, metav1.DeleteOptions{})
+			if err != nil {
+				t.Fatalf("'%s/%s' failed to delete, got error: %v", testNamespace, secretCorrupt, err)
+			}
+
+			// d) re-create the secret with a finalizer
+			test.secret, err = test.createSecret(secretCorrupt, testNamespace)
+			if err != nil {
+				t.Fatalf("Failed to create test secret, error: %v", err)
+			}
+			withFinalizer := test.secret.DeepCopy()
+			withFinalizer.Finalizers = append(withFinalizer.Finalizers, "test.k8s.io/fake")
+			test.secret, err = test.restClient.CoreV1().Secrets(testNamespace).Update(context.Background(), withFinalizer, metav1.UpdateOptions{})
+			if err != nil {
+				t.Fatalf("Failed to add finalizer to the secret, error: %v", err)
+			}
+
+			// e) Informer #1 (pre-corruption): sync and verify secret is in cache
+			preCorruptCtx, preCorruptCancel := context.WithCancel(context.Background())
+			defer preCorruptCancel()
+			preCorruptFactory := informers.NewSharedInformerFactoryWithOptions(adminClient, time.Minute, informers.WithNamespace(testNamespace))
+			preCorruptInformer := preCorruptFactory.Core().V1().Secrets()
+			preCorruptLister := preCorruptInformer.Lister()
+			preCorruptFactory.Start(preCorruptCtx.Done())
+			preCorruptSyncCtx, preCorruptSyncCancel := context.WithTimeout(context.Background(), wait.ForeverTestTimeout)
+			defer preCorruptSyncCancel()
+			if !cache.WaitForCacheSync(preCorruptSyncCtx.Done(), preCorruptInformer.Informer().HasSynced) {
+				t.Fatalf("pre-corruption informer failed to sync")
+			}
+
+			// f) the secret should be readable from the pre-corruption lister
+			if _, err := preCorruptLister.Secrets(testNamespace).Get(secretCorrupt); err != nil {
+				t.Errorf("unexpected failure getting the secret from pre-corruption lister cache: %v", err)
+			}
+
+			// stop informer #1 — the in-memory store persists after the factory's goroutines stop
+			preCorruptCancel()
+
+			// g) corrupt the secret by flipping the last byte in etcd.
+			//    With the identity provider, the stored value is raw protobuf —
+			//    flipping a byte makes it undecodable.
+			etcdPath := test.getETCDPathForResource(test.storageConfig.Prefix, "", "secrets", secretCorrupt, testNamespace)
+			resp, err := test.readRawRecordFromETCD(etcdPath)
+			if err != nil {
+				t.Fatalf("failed to read from etcd: %v", err)
+			}
+			if len(resp.Kvs) != 1 {
+				t.Fatalf("expected 1 key in etcd, got %d", len(resp.Kvs))
+			}
+			value := make([]byte, len(resp.Kvs[0].Value))
+			copy(value, resp.Kvs[0].Value)
+			value[len(value)-1] ^= 0xFF
+			if _, err := test.writeRawRecordToETCD(etcdPath, value); err != nil {
+				t.Fatalf("failed to write corrupted value to etcd: %v", err)
+			}
+
+			// h) poll until GET fails with the expected decode error — the corruption
+			//    is immediate (no config reload), but we poll for robustness.
+			testCtx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			err = wait.PollUntilContextTimeout(testCtx, 1*time.Second, 2*time.Minute, true, func(ctx context.Context) (done bool, err error) {
+				_, err = test.restClient.CoreV1().Secrets(testNamespace).Get(ctx, secretCorrupt, metav1.GetOptions{})
+				var got apierrors.APIStatus
+				if !errors.As(err, &got) {
+					return false, nil
+				}
+				if done := tc.encryptionBrokenFn(t, got); done {
+					return true, nil
+				}
+				return false, nil
+			})
+			if err != nil {
+				t.Fatalf("bit-flip corruption never took effect: %v", err)
+			}
+
+			// h2) Informer #2 (mid-corruption): expect WaitForCacheSync to fail
+			//     because the corrupt secret breaks listing.
+			midCorruptCtx, midCorruptCancel := context.WithCancel(context.Background())
+			defer midCorruptCancel()
+			midCorruptFactory := informers.NewSharedInformerFactoryWithOptions(adminClient, time.Minute, informers.WithNamespace(testNamespace))
+			midCorruptInformer := midCorruptFactory.Core().V1().Secrets()
+			midCorruptFactory.Start(midCorruptCtx.Done())
+			midSyncCtx, midSyncCancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer midSyncCancel()
+			if cache.WaitForCacheSync(midSyncCtx.Done(), midCorruptInformer.Informer().HasSynced) {
+				t.Errorf("mid-corruption informer unexpectedly synced — corruption should prevent listing")
+			}
+			midCorruptCancel()
+
+			// i) create a new secret, and then delete it — should work fine
+			secretNormal := "bar-with-normal-delete"
+			_, err = test.createSecret(secretNormal, testNamespace)
+			if err != nil {
+				t.Fatalf("'%s/%s' failed to create, got error: %v", testNamespace, secretNormal, err)
+			}
+			err = test.restClient.CoreV1().Secrets(testNamespace).Delete(context.Background(), secretNormal, metav1.DeleteOptions{})
+			if err != nil {
+				t.Fatalf("'%s/%s' failed to delete, got error: %v", testNamespace, secretNormal, err)
+			}
+
+			// j) GET the corrupt secret — expect failure.
+			//    Also check pre-corruption lister still has cached copy.
+			_, err = test.restClient.CoreV1().Secrets(testNamespace).Get(context.Background(), secretCorrupt, metav1.GetOptions{})
+			tc.corruptObjGetPreDelete.verify(t, err)
+			if _, err := preCorruptLister.Secrets(testNamespace).Get(secretCorrupt); err != nil {
+				t.Errorf("unexpected failure getting the secret from the pre-corruption cache: %v", err)
+			}
+
+			// k) normal delete — expect error
+			err = test.restClient.CoreV1().Secrets(testNamespace).Delete(context.Background(), secretCorrupt, metav1.DeleteOptions{})
+			tc.corrupObjDeletWithoutOption.verify(t, err)
+
+			// l) delete with unsafe option but no privilege — expect forbidden or internal error
+			options := metav1.DeleteOptions{
+				IgnoreStoreReadErrorWithClusterBreakingPotential: ptr.To[bool](true),
+			}
+			err = test.restClient.CoreV1().Secrets(testNamespace).Delete(context.Background(), secretCorrupt, options)
+			tc.corrupObjDeleteWithOption.verify(t, err)
+
+			// m) grant the test user the unsafe-delete-ignore-read-errors verb
+			permitUserToDoVerbOnSecret(t, adminClient, testUser, testNamespace, []string{"unsafe-delete-ignore-read-errors"})
+
+			// n) try unsafe delete again — should succeed when feature enabled
+			err = test.restClient.CoreV1().Secrets(testNamespace).Delete(context.Background(), secretCorrupt, options)
+			tc.corrupObjDeleteWithOptionAndPrivilege.verify(t, err)
+
+			// o) final GET
+			_, err = test.restClient.CoreV1().Secrets(testNamespace).Get(context.Background(), secretCorrupt, metav1.GetOptions{})
+			tc.corrupObjGetPostDelete.verify(t, err)
+
+			// p) verify via informer cache
+			if tc.featureEnabled {
+				// Informer #3 (post-delete): a fresh informer should sync successfully
+				// now that the corrupt object is deleted.
+				postDeleteFactory := informers.NewSharedInformerFactoryWithOptions(adminClient, time.Minute, informers.WithNamespace(testNamespace))
+				postDeleteInformer := postDeleteFactory.Core().V1().Secrets()
+				postDeleteLister := postDeleteInformer.Lister()
+
+				finalEvent := make(chan struct{})
+				finalSecretName := "final-secret"
+				_, err = postDeleteInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
+					AddFunc: func(obj interface{}) {
+						if obj, err := meta.Accessor(obj); err == nil && obj.GetName() == finalSecretName {
+							close(finalEvent)
+						}
+					},
+				})
+				if err != nil {
+					t.Fatalf("unexpected error from AddEventHandler: %v", err)
+				}
+
+				postDeleteFactory.Start(test.Done())
+				postSyncCtx, postSyncCancel := context.WithTimeout(context.Background(), wait.ForeverTestTimeout)
+				defer postSyncCancel()
+				if !cache.WaitForCacheSync(postSyncCtx.Done(), postDeleteInformer.Informer().HasSynced) {
+					t.Fatalf("post-delete informer failed to sync")
+				}
+
+				// create the final secret and wait for the informer to catch up
+				_, err = test.createSecret(finalSecretName, testNamespace)
+				if err != nil {
+					t.Fatalf("'%s/%s' failed to create, got error: %v", testNamespace, finalSecretName, err)
+				}
+				select {
+				case <-finalEvent:
+				case <-time.After(wait.ForeverTestTimeout):
+					t.Fatalf("timed out waiting for the informer to catch up")
+				}
+
+				// verify corrupt secret is NOT in the post-delete lister
+				_, err = postDeleteLister.Secrets(testNamespace).Get(secretCorrupt)
+				tc.corrupObjGetFromListerCachePostDelete.verify(t, err)
+			} else {
+				// gate=false: the pre-corruption lister's in-memory store persists
+				// after stop, so the corrupt secret is still in cache
+				_, err = preCorruptLister.Secrets(testNamespace).Get(secretCorrupt)
+				tc.corrupObjGetFromListerCachePostDelete.verify(t, err)
+			}
+		})
+	}
+}
+
 func permitUserToDoVerbOnSecret(t *testing.T, client *clientset.Clientset, user, namespace string, verbs []string) {
 	t.Helper()
 

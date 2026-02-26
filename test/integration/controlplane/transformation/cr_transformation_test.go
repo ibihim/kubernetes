@@ -667,7 +667,7 @@ func TestCRBitFlipCorruptObjectDeletion(t *testing.T) {
 			}
 			value := make([]byte, len(resp.Kvs[0].Value))
 			copy(value, resp.Kvs[0].Value)
-			value[len(value)/2] ^= 0xFF
+			value[len(value)-1] ^= 0xFF
 			if _, err := test.writeRawRecordToETCD(etcdPath, value); err != nil {
 				t.Fatalf("failed to write corrupted value to etcd: %v", err)
 			}
