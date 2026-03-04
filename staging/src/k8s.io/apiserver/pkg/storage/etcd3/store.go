@@ -351,17 +351,17 @@ func (s *store) Delete(
 		return fmt.Errorf("unable to convert output object to pointer: %v", err)
 	}
 
-	skipTransformDecode := false
+	expectTransformOrDecodeError := false
 	if utilfeature.DefaultFeatureGate.Enabled(features.AllowUnsafeMalformedObjectDeletion) {
-		skipTransformDecode = opts.IgnoreStoreReadError
+		expectTransformOrDecodeError = opts.ExpectTransformOrDecodeError
 	}
-	return s.conditionalDelete(ctx, preparedKey, out, v, preconditions, validateDeletion, cachedExistingObject, skipTransformDecode)
+	return s.conditionalDelete(ctx, preparedKey, out, v, preconditions, validateDeletion, cachedExistingObject, expectTransformOrDecodeError)
 }
 
 func (s *store) conditionalDelete(
 	ctx context.Context, key string, out runtime.Object, v reflect.Value, preconditions *storage.Preconditions,
-	validateDeletion storage.ValidateObjectFunc, cachedExistingObject runtime.Object, skipTransformDecode bool) error {
-	getCurrentState := s.getCurrentState(ctx, key, v, false, skipTransformDecode)
+	validateDeletion storage.ValidateObjectFunc, cachedExistingObject runtime.Object, expectTransformOrDecodeError bool) error {
+	getCurrentState := s.getCurrentState(ctx, key, v, false, expectTransformOrDecodeError)
 
 	var origState *objState
 	var err error
@@ -440,7 +440,7 @@ func (s *store) conditionalDelete(
 		}
 		if !txnResp.Succeeded {
 			klog.V(4).Infof("deletion of %s failed because of a conflict, going to retry", key)
-			origState, err = s.getState(ctx, txnResp.KV, key, v, false, skipTransformDecode)
+			origState, err = s.getState(ctx, txnResp.KV, key, v, false, expectTransformOrDecodeError)
 			if err != nil {
 				return err
 			}
@@ -448,7 +448,7 @@ func (s *store) conditionalDelete(
 			continue
 		}
 
-		if !skipTransformDecode {
+		if !expectTransformOrDecodeError {
 			err = s.decoder.Decode(origState.data, out, txnResp.Revision)
 			if err != nil {
 				recordDecodeError(s.groupResource, key)
@@ -982,7 +982,7 @@ func (s *store) watchContext(ctx context.Context) context.Context {
 	return clientv3.WithRequireLeader(ctx)
 }
 
-func (s *store) getCurrentState(ctx context.Context, key string, v reflect.Value, ignoreNotFound bool, skipTransformDecode bool) func() (*objState, error) {
+func (s *store) getCurrentState(ctx context.Context, key string, v reflect.Value, ignoreNotFound bool, expectTransformOrDecodeError bool) func() (*objState, error) {
 	return func() (*objState, error) {
 		startTime := time.Now()
 		getResp, err := s.client.Kubernetes.Get(ctx, key, kubernetes.GetOptions{})
@@ -990,7 +990,7 @@ func (s *store) getCurrentState(ctx context.Context, key string, v reflect.Value
 		if err != nil {
 			return nil, err
 		}
-		return s.getState(ctx, getResp.KV, key, v, ignoreNotFound, skipTransformDecode)
+		return s.getState(ctx, getResp.KV, key, v, ignoreNotFound, expectTransformOrDecodeError)
 	}
 }
 
@@ -1000,7 +1000,7 @@ func (s *store) getCurrentState(ctx context.Context, key string, v reflect.Value
 // storage will be transformed and decoded.
 // NOTE: when skipTransformDecode is true, the 'data', and the 'obj' fields
 // of the objState will be nil, and 'stale' will be set to true.
-func (s *store) getState(ctx context.Context, kv *mvccpb.KeyValue, key string, v reflect.Value, ignoreNotFound bool, skipTransformDecode bool) (*objState, error) {
+func (s *store) getState(ctx context.Context, kv *mvccpb.KeyValue, key string, v reflect.Value, ignoreNotFound bool, expectTransformOrDecodeError bool) (*objState, error) {
 	state := &objState{
 		meta: &storage.ResponseMeta{},
 	}
@@ -1022,26 +1022,38 @@ func (s *store) getState(ctx context.Context, kv *mvccpb.KeyValue, key string, v
 		state.rev = kv.ModRevision
 		state.meta.ResourceVersion = uint64(state.rev)
 
-		if skipTransformDecode {
+		data, stale, err := s.transformer.TransformFromStorage(ctx, kv.Value, authenticatedDataString(key))
+		if err != nil {
+			if !expectTransformOrDecodeError {
+				return nil, storage.NewInternalError(err)
+			}
+
 			// be explicit that we don't have the object
 			state.obj = nil
 			state.stale = true // this seems a more sane value here
 			return state, nil
 		}
 
-		data, stale, err := s.transformer.TransformFromStorage(ctx, kv.Value, authenticatedDataString(key))
-		if err != nil {
-			return nil, storage.NewInternalError(err)
-		}
-
 		state.data = data
 		state.stale = stale
 
 		if err := s.decoder.Decode(state.data, state.obj, state.rev); err != nil {
-			recordDecodeError(s.groupResource, key)
-			return nil, err
+			if !expectTransformOrDecodeError {
+				recordDecodeError(s.groupResource, key)
+				return nil, err
+			}
+
+			// be explicit that we don't have the object
+			state.obj = nil
+			state.stale = true // this seems a more sane value here
+			return state, nil
 		}
 	}
+
+	if expectTransformOrDecodeError {
+		return nil, storage.NewInvalidObjError(key, "expected undecodable object")
+	}
+
 	return state, nil
 }
 

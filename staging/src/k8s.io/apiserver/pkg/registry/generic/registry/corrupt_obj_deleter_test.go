@@ -325,7 +325,7 @@ func (s *corruptStorage) Get(ctx context.Context, key string, opts storage.GetOp
 }
 
 func (s *corruptStorage) Delete(ctx context.Context, key string, out runtime.Object, preconditions *storage.Preconditions, deleteValidation storage.ValidateObjectFunc, cachedExistingObject runtime.Object, opts storage.DeleteOptions) error {
-	if opts.IgnoreStoreReadError {
+	if opts.ExpectTransformOrDecodeError {
 		s.unsafeDeleteInvoked++
 	}
 	return s.Interface.Delete(ctx, key, out, preconditions, deleteValidation, cachedExistingObject, opts)

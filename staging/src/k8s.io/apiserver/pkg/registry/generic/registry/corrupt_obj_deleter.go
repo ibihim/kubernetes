@@ -19,13 +19,10 @@ package registry
 import (
 	"context"
 	"errors"
-	"strings"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/apimachinery/pkg/runtime/schema"
-	"k8s.io/apimachinery/pkg/util/validation/field"
 	genericapirequest "k8s.io/apiserver/pkg/endpoints/request"
 	"k8s.io/apiserver/pkg/registry/rest"
 	"k8s.io/apiserver/pkg/storage"
@@ -72,41 +69,12 @@ func (d *corruptObjectDeleter) Delete(ctx context.Context, name string, deleteVa
 	if err != nil {
 		return nil, false, err
 	}
-	obj := d.store.NewFunc()
 	qualifiedResource := d.store.qualifiedResourceFromContext(ctx)
 	// use the storage implementation directly, bypass the dryRun layer
 	storageBackend := d.store.Storage.Storage
-	// we leave ResourceVersion as empty in the GetOptions so the
-	// object is retrieved from the underlying storage directly
-	err = storageBackend.Get(ctx, key, storage.GetOptions{}, obj)
-	if err == nil || !storage.IsCorruptObject(err) {
-		// TODO: The Invalid error should have a field for Resource.
-		// After that field is added, we should fill the Resource and
-		// leave the Kind field empty. See the discussion in #18526.
-		qualifiedKind := schema.GroupKind{Group: qualifiedResource.Group, Kind: qualifiedResource.Resource}
-		fieldErrList := field.ErrorList{
-			field.Invalid(field.NewPath("ignoreStoreReadErrorWithClusterBreakingPotential"), true, "is exclusively used to delete corrupt object(s), try again by removing this option"),
-		}
-		return nil, false, apierrors.NewInvalid(qualifiedKind, name, fieldErrList)
-	}
-
-	// try normal deletion anyway, it is expected to fail
-	obj, deleted, err := d.store.Delete(ctx, name, deleteValidation, opts)
-	if err == nil {
-		return obj, deleted, err
-	}
-	// TODO: unfortunately we can't do storage.IsCorruptObject(err),
-	// conversion to API error drops the inner error chain
-	if !strings.Contains(err.Error(), "corrupt object") {
-		return obj, deleted, err
-	}
-
-	// TODO: at this instant, some actor may have a) managed to recreate this
-	// object by doing a delete+create, or b) the underlying error has resolved
-	// since the last time we checked, and the object is readable now.
 	klog.FromContext(ctx).V(1).Info("Going to perform unsafe object deletion", "object", klog.KRef(genericapirequest.NamespaceValue(ctx), name))
 	out := d.store.NewFunc()
-	storageOpts := storage.DeleteOptions{IgnoreStoreReadError: true}
+	storageOpts := storage.DeleteOptions{ExpectTransformOrDecodeError: true}
 	// we don't have the old object in the cache, neither can it be
 	// retrieved from the storage and decoded into an object
 	// successfully, so we do the following:
@@ -120,9 +88,11 @@ func (d *corruptObjectDeleter) Delete(ctx context.Context, name string, deleteVa
 			// not retrievable from the storage, so we send a nil object
 			return nil, false, nil
 		}
+		// todo: if the resource was transformed+decoded, expect storage layer to return
+		// some error we can translate into a 4xx
 		return nil, false, storeerr.InterpretDeleteError(err, qualifiedResource, name)
 	}
-	// the DELETE succeeded, but we don't have the object sine it's
+	// the DELETE succeeded, but we don't have the object since it's
 	// not retrievable from the storage, so we send a nil objct
 	return nil, true, nil
 }
