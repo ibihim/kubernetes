@@ -160,6 +160,88 @@ func TestDeleteWithConflict(t *testing.T) {
 	storagetesting.RunTestDeleteWithConflict(ctx, t, store)
 }
 
+// TestDeleteWithConflictOnUnsafeDelete demonstrates that when Delete
+// is called with IgnoreStoreReadError and the first OptimisticDelete
+// fails due to a concurrent update that makes the object decodable,
+// the retry still deletes the now-valid object without error.
+//
+// This test is expected to fail against the current implementation:
+// the retry path in conditionalDelete uses skipTransformDecode=true
+// for the entire loop, so it never re-evaluates whether the object
+// is still corrupt after the revision changes.
+func TestDeleteWithConflictOnUnsafeDelete(t *testing.T) {
+	featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.AllowUnsafeMalformedObjectDeletion, true)
+
+	ctx, s, _ := testSetup(t)
+
+	// Create a valid object.
+	key := "/pods/test-ns/foo"
+	obj := &example.Pod{ObjectMeta: metav1.ObjectMeta{Name: "foo", Namespace: "test-ns"}}
+	out := &example.Pod{}
+	if err := s.Create(ctx, key, obj, out, 0); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	// Corrupt the transformer so TransformFromStorage always fails.
+	// The bytes in etcd are unchanged and valid.
+	origTransformer := s.transformer
+	s.transformer = &corruptedTransformer{Transformer: origTransformer}
+
+	// Sanity check: the object is now unreadable via the store.
+	if err := s.Get(ctx, key, storage.GetOptions{}, &example.Pod{}); err == nil {
+		t.Fatal("expected Get to fail with corrupted transformer")
+	}
+
+	// Prepare a validateDeletion callback that, on its first call,
+	// restores the transformer and writes a new revision of the
+	// key. This bumps the ModRevision so the first OptimisticDelete
+	// will fail. After the restore, the object is fully decodable.
+	validateCount := 0
+	injectUpdate := func(_ context.Context, _ runtime.Object) error {
+		validateCount++
+		if validateCount > 1 {
+			return nil
+		}
+		// Restore the working transformer.
+		s.transformer = origTransformer
+
+		// Write a new revision via GuaranteedUpdate. The value
+		// goes through TransformToStorage with the working
+		// transformer, producing valid bytes in etcd.
+		return s.GuaranteedUpdate(ctx, key, &example.Pod{}, false, nil,
+			storage.SimpleUpdate(func(obj runtime.Object) (runtime.Object, error) {
+				pod := obj.(*example.Pod)
+				pod.Labels = map[string]string{"repaired": "true"}
+				return pod, nil
+			}), nil)
+	}
+
+	// Delete with IgnoreStoreReadError.
+	//
+	// Expected flow through conditionalDelete:
+	//   1. getCurrentState(skipTransformDecode=true) gets revision
+	//      R1, sets obj=nil.
+	//   2. validateDeletion(ctx, nil) invokes the callback:
+	//      restores the transformer and updates the key to R2.
+	//   3. OptimisticDelete(key, R1) fails because R1 != R2.
+	//   4. Retry: getState(txnResp.KV, skipTransformDecode=true)
+	//      reads the KV at R2 but still sets obj=nil because
+	//      skipTransformDecode is true for the entire loop.
+	//   5. validateDeletion(ctx, nil) is a no-op (second call).
+	//   6. OptimisticDelete(key, R2) succeeds, deleting data that
+	//      is now fully decodable.
+	//
+	// The object at R2 is not corrupt. This delete should not
+	// have succeeded.
+	err := s.Delete(ctx, key, &example.Pod{}, nil, injectUpdate, nil,
+		storage.DeleteOptions{IgnoreStoreReadError: true})
+	if err == nil {
+		t.Fatal("expected Delete to return an error: the object was" +
+			" no longer corrupt at the revision that was actually" +
+			" deleted from storage")
+	}
+}
+
 func TestPreconditionalDeleteWithSuggestion(t *testing.T) {
 	ctx, store, _ := testSetup(t)
 	storagetesting.RunTestPreconditionalDeleteWithSuggestion(ctx, t, store)
