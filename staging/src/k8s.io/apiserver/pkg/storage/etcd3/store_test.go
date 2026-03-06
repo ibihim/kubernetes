@@ -234,7 +234,7 @@ func TestDeleteWithConflictOnUnsafeDelete(t *testing.T) {
 	// The object at R2 is not corrupt. This delete should not
 	// have succeeded.
 	err := s.Delete(ctx, key, &example.Pod{}, nil, injectUpdate, nil,
-		storage.DeleteOptions{IgnoreStoreReadError: true})
+		storage.DeleteOptions{ExpectTransformOrDecodeError: true})
 	if err == nil {
 		t.Fatal("expected Delete to return an error: the object was" +
 			" no longer corrupt at the revision that was actually" +
