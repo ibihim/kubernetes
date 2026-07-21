@@ -17,6 +17,7 @@ limitations under the License.
 package versioning
 
 import (
+	"errors"
 	"fmt"
 	"io/ioutil"
 	"testing"
@@ -192,7 +193,7 @@ func (c *mockUnstructuredNopConvertor) ConvertToVersion(in runtime.Object, outVe
 	if !matched {
 		return nil, fmt.Errorf("attempt to convert to mismatched gv %v", outVersion)
 	}
-	if err := c.recognizeGVK(out.GetObjectKind().GroupVersionKind()); err != nil {
+	if err := c.recognizeGVK(targetGVK); err != nil {
 		return nil, err
 	}
 	out.GetObjectKind().SetGroupVersionKind(targetGVK)
@@ -272,11 +273,11 @@ func TestDecodeUnstructured(t *testing.T) {
 			suggestedConvertVersion: internalGVK.GroupVersion(),
 			intoObj:                 internalUnstructuredDecodable,
 			errFunc: func(err error) bool {
-				notRecognized, ok := err.(errNotRecognizedGVK)
-				if !ok {
+				var notRecognized errNotRecognizedGVK
+				if !errors.As(err, &notRecognized) {
 					return false
 				}
-				return assert.Equal(t, notRecognized.failedGVK, internalGVK)
+				return assert.Equal(t, notRecognized.failedGVK, internalGVK) && runtime.IsConversionFailedError(err)
 			},
 		},
 		{
@@ -290,11 +291,11 @@ func TestDecodeUnstructured(t *testing.T) {
 			suggestedConvertVersion: internalGVK.GroupVersion(),
 			intoObj:                 nil,
 			errFunc: func(err error) bool {
-				notRecognized, ok := err.(errNotRecognizedGVK)
-				if !ok {
+				var notRecognized errNotRecognizedGVK
+				if !errors.As(err, &notRecognized) {
 					return false
 				}
-				return assert.Equal(t, notRecognized.failedGVK, internalGVK)
+				return assert.Equal(t, notRecognized.failedGVK, internalGVK) && runtime.IsConversionFailedError(err)
 			},
 		},
 		{
@@ -318,7 +319,7 @@ func TestDecodeUnstructured(t *testing.T) {
 			},
 			suggestedConvertVersion: internalGVK.GroupVersion(),
 			errFunc: func(err error) bool {
-				return assert.Equal(t, err, fmt.Errorf("no matching decode version"))
+				return assert.EqualError(t, err, "no matching decode version") && runtime.IsConversionFailedError(err)
 			},
 		},
 	}
@@ -329,7 +330,7 @@ func TestDecodeUnstructured(t *testing.T) {
 			if !testCase.errFunc(err) {
 				t.Errorf("%v: failed: %v", testCase.name, err)
 			}
-			return
+			continue
 		}
 		assert.NoError(t, err)
 		assert.Equal(t, testCase.expectedOut, actualObj, "%v failed", testCase.name)

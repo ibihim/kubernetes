@@ -17,6 +17,7 @@ limitations under the License.
 package runtime
 
 import (
+	"errors"
 	"fmt"
 	"reflect"
 	"strings"
@@ -169,4 +170,36 @@ func AsStrictDecodingError(err error) (*strictDecodingError, bool) {
 	}
 	strictErr, ok := err.(*strictDecodingError)
 	return strictErr, ok
+}
+
+// conversionFailedError is returned by a versioning codec's Decode when the
+// object was deserialized successfully but could not be converted to the
+// requested version.
+type conversionFailedError struct {
+	err error
+}
+
+// NewConversionFailedError marks err as a version conversion failure of a
+// successfully deserialized object, as opposed to a failure to deserialize
+// the raw bytes. The storage layer relies on this distinction to tell a
+// broken converter apart from corrupt data.
+func NewConversionFailedError(err error) error {
+	return &conversionFailedError{err: err}
+}
+
+// Error returns the message of the underlying error unchanged so that
+// callers matching on conversion failure messages are unaffected.
+func (e *conversionFailedError) Error() string {
+	return e.err.Error()
+}
+
+func (e *conversionFailedError) Unwrap() error {
+	return e.err
+}
+
+// IsConversionFailedError returns true if err or any error it wraps marks a
+// version conversion failure.
+func IsConversionFailedError(err error) bool {
+	var conversionErr *conversionFailedError
+	return errors.As(err, &conversionErr)
 }

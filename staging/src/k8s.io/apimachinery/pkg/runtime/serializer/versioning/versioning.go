@@ -176,7 +176,7 @@ func (c *codec) Decode(data []byte, defaultGVK *schema.GroupVersionKind, into ru
 		}
 
 		if err := c.convertor.Convert(obj, into, c.decodeVersion); err != nil {
-			return nil, gvk, err
+			return nil, gvk, runtime.NewConversionFailedError(err)
 		}
 
 		return into, gvk, strictDecodingErr
@@ -189,7 +189,7 @@ func (c *codec) Decode(data []byte, defaultGVK *schema.GroupVersionKind, into ru
 
 	out, err := c.convertor.ConvertToVersion(obj, c.decodeVersion)
 	if err != nil {
-		return nil, gvk, err
+		return nil, gvk, runtime.NewConversionFailedError(err)
 	}
 	return out, gvk, strictDecodingErr
 }

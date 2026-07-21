@@ -207,6 +207,28 @@ func TestDecode(t *testing.T) {
 			expectedGVK:    gvk1,
 			expectedObject: decodable1,
 		},
+		// an error from ConvertToVersion is marked as a conversion failure,
+		// with the message unchanged
+		{
+			serializer:  &mockSerializer{actual: gvk1, obj: decodable1},
+			convertor:   &checkConvertor{in: decodable1, groupVersion: schema.GroupVersion{Group: "other", Version: runtime.APIVersionInternal}, err: fmt.Errorf("conversion failed")},
+			expectedGVK: gvk1,
+			decodes:     schema.GroupVersion{Group: "other", Version: runtime.APIVersionInternal},
+			errFn: func(err error) bool {
+				return runtime.IsConversionFailedError(err) && err.Error() == "conversion failed"
+			},
+		},
+		// an error from direct Convert into a target is marked as a
+		// conversion failure, with the message unchanged
+		{
+			into:        decodable3,
+			serializer:  &mockSerializer{actual: gvk1, obj: decodable1},
+			convertor:   &checkConvertor{in: decodable1, directConvert: true, err: fmt.Errorf("conversion failed")},
+			expectedGVK: gvk1,
+			errFn: func(err error) bool {
+				return runtime.IsConversionFailedError(err) && err.Error() == "conversion failed"
+			},
+		},
 	}
 
 	for i, test := range testCases {
