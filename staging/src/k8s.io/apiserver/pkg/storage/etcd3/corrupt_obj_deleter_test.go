@@ -17,9 +17,11 @@ limitations under the License.
 package etcd3
 
 import (
+	"context"
 	"errors"
 	"testing"
 
+	"k8s.io/apimachinery/pkg/runtime"
 	utilerrors "k8s.io/apimachinery/pkg/util/errors"
 )
 
@@ -55,6 +57,60 @@ func TestAggregatedStorageErrorMessage(t *testing.T) {
 			if want, got := test.want, err.Error(); want != got {
 				t.Errorf("unexpected error message, want:\n%s\ngot:\n%s", want, got)
 			}
+		})
+	}
+}
+
+type fakeDecoder struct {
+	err error
+}
+
+func (d *fakeDecoder) Decode(value []byte, objPtr runtime.Object, rev int64) error {
+	return d.err
+}
+
+func (d *fakeDecoder) DecodeListItem(ctx context.Context, data []byte, rev uint64, newItemFunc func() runtime.Object) (runtime.Object, error) {
+	return nil, d.err
+}
+
+func TestCorruptObjErrorInterpretingDecoder(t *testing.T) {
+	tests := []struct {
+		name        string
+		err         error
+		wantCorrupt bool
+	}{
+		{
+			name: "no error",
+		},
+		{
+			name:        "decode error is deemed a corrupt object",
+			err:         errors.New("object not decodable"),
+			wantCorrupt: true,
+		},
+		{
+			name: "conversion failure is not deemed a corrupt object",
+			err:  runtime.NewConversionFailedError(errors.New("conversion webhook failed")),
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			decoder := WithCorruptObjErrorHandlingDecoder(&fakeDecoder{err: test.err})
+
+			verify := func(t *testing.T, got error) {
+				t.Helper()
+				var corruptObjErr *corruptObjectError
+				if want, isCorrupt := test.wantCorrupt, errors.As(got, &corruptObjErr); want != isCorrupt {
+					t.Errorf("corrupt object error: want %t, got %t, error: %v", want, isCorrupt, got)
+				}
+				if !test.wantCorrupt && !errors.Is(got, test.err) {
+					t.Errorf("expected the error to be returned unchanged, want: %v, got: %v", test.err, got)
+				}
+			}
+
+			verify(t, decoder.Decode(nil, nil, 1))
+			_, err := decoder.DecodeListItem(context.Background(), nil, 1, nil)
+			verify(t, err)
 		})
 	}
 }

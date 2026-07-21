@@ -160,9 +160,13 @@ type corruptObjErrorInterpretingDecoder struct {
 }
 
 func (d *corruptObjErrorInterpretingDecoder) Decode(value []byte, objPtr runtime.Object, rev int64) error {
-	// TODO: right now any error is deemed as undecodable, in
-	// the future, we can apply some filter, if need be.
 	if err := d.Decoder.Decode(value, objPtr, rev); err != nil {
+		// a conversion failure means the converter is broken or unavailable,
+		// not that the stored data is corrupt, so it must never make the
+		// object a candidate for unsafe deletion.
+		if runtime.IsConversionFailedError(err) {
+			return err
+		}
 		return &corruptObjectError{err: err, errType: undecodable, revision: rev}
 	}
 	return nil
@@ -170,10 +174,8 @@ func (d *corruptObjErrorInterpretingDecoder) Decode(value []byte, objPtr runtime
 
 // decodeListItem decodes bytes value in array into object.
 func (d *corruptObjErrorInterpretingDecoder) DecodeListItem(ctx context.Context, data []byte, rev uint64, newItemFunc func() runtime.Object) (runtime.Object, error) {
-	// TODO: right now any error is deemed as undecodable, in
-	// the future, we can apply some filter, if need be.
 	obj, err := d.Decoder.DecodeListItem(ctx, data, rev, newItemFunc)
-	if err != nil {
+	if err != nil && !runtime.IsConversionFailedError(err) {
 		err = &corruptObjectError{err: err, errType: undecodable, revision: int64(rev)}
 	}
 	return obj, err
